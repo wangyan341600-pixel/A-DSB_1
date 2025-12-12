@@ -1,0 +1,71 @@
+{
+  "version": "1.0.0",
+  "recordedAt": "2024-12-09T10:00:00.000Z",
+  "duration": 10000,
+  "mapConfig": {
+    "center": [39.9042, 116.4074],
+    "zoom": 9
+  },
+  "events": [
+    {
+      "timestamp": 0,
+      "type": "init",
+      "data": {
+        "truthStates": [
+          {
+            "id": "780000",
+            "lat": 39.9042,
+            "lng": 116.4074,
+            "heading": 45,
+            "speed": 250,
+            "altitude": 10000,
+            "nic": 8,
+            "callsign": "TEST001"
+          },
+          {
+            "id": "780001",
+            "lat": 40.0,
+            "lng": 116.5,
+            "heading": 90,
+            "speed": 300,
+            "altitude": 15000,
+            "nic": 10,
+            "callsign": "TEST002"
+          }
+        ]
+      }
+    },
+    {
+      "timestamp": 1000,
+      "type": "message",
+      "data": {
+        "hexMessage": "8D7800005899E0A128D1080908190000000000000000A5A5A5"
+      }
+    },
+    {
+      "timestamp": 2000,
+      "type": "message",
+      "data": {
+        "hexMessage": "8D7800015899E0A130D1100A08190000000000000000A5A5A5"
+      }
+    },
+    {
+      "timestamp": 3000,
+      "type": "message",
+      "data": {
+        "hexMessage": "8D7800005899E0A128D1080908190000000000000000A5A5A5"
+      }
+    },
+    {
+      "timestamp": 4000,
+      "type": "message",
+      "data": {
+        "hexMessage": "8D7800015899E0A130D1100A08190000000000000000A5A5A5"
+      }
+    }
+  ],
+  "metadata": {
+    "description": "Test recording - 2 aircraft",
+    "tags": ["adsb", "test"]
+  }
+}
