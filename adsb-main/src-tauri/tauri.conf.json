@@ -12,13 +12,15 @@
   "app": {
     "windows": [
       {
-        "title": "adsb",
-        "width": 800,
-        "height": 600
+        "title": "ADS-B 雷达监控系统",
+        "width": 1400,
+        "height": 900,
+        "center": true,
+        "resizable": true
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://*.tile.openstreetmap.org https://*.openstreetmap.org https://tile.openstreetmap.org; connect-src 'self' https://*.tile.openstreetmap.org https://*.openstreetmap.org https://tile.openstreetmap.org ipc: http://ipc.localhost"
     }
   },
   "bundle": {

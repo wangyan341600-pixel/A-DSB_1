@@ -323,15 +323,17 @@ export class ReplayEngine {
    * 获取当前状态信息
    */
   getStatus() {
+    const currentTime = this.state === 'playing' 
+      ? (Date.now() - this.playbackStartTime) * this.playbackSpeed
+      : this.pausedAt;
+    
     return {
       state: this.state,
       speed: this.playbackSpeed,
-      currentTime: this.state === 'playing' 
-        ? Date.now() - this.playbackStartTime 
-        : this.pausedAt,
+      currentTime: currentTime,
       totalTime: this.session?.duration || 0,
       progress: this.session 
-        ? ((this.state === 'playing' ? Date.now() - this.playbackStartTime : this.pausedAt) / this.session.duration) 
+        ? Math.min((currentTime / this.session.duration) * 100, 100)
         : 0
     };
   }
@@ -425,7 +427,8 @@ export class ReplayEngine {
       ? (Date.now() - this.playbackStartTime) * this.playbackSpeed
       : this.pausedAt;
     
-    const progress = Math.min(currentTime / this.session.duration, 1);
+    // 返回 0-100 的百分比值，方便 UI 的 range slider 使用
+    const progress = Math.min((currentTime / this.session.duration) * 100, 100);
     this.onProgressCallback?.(progress, currentTime, this.session.duration);
   }
 }

@@ -7,6 +7,14 @@ import { AdsbSimulator, AdsbDecoder, type DecodedPosition, type DecodedVelocity 
 import { AdsbRecorder, ReplayEngine, StorageManager, type PlaybackState } from '../utils/recorder';
 import type { AircraftState, TrajectoryPoint, AircraftTrajectory } from '../utils/types';
 
+// Tauri API 导入
+import { invoke } from '@tauri-apps/api/core';
+import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+
+// 数据源模式：'frontend' 使用前端 JS 模拟，'backend' 使用 Rust 后端
+const dataSource = ref<'frontend' | 'backend'>('frontend');
+let tauriUnlisten: UnlistenFn | null = null;
+
 const mapContainer = ref<HTMLElement | null>(null);
 const logContainer = ref<HTMLElement | null>(null);
 const aircrafts = ref<Map<string, AircraftState>>(new Map());
@@ -499,7 +507,11 @@ const updateMap = (replayTargetTime?: number) => {
   }
 };
 
-onMounted(() => {
+onMounted(async () => {
+  // 初始化并更新日期时间
+  updateDateTime();
+  setInterval(updateDateTime, 1000);
+
   if (mapContainer.value) {
     // 深圳坐标：22.5431°N, 114.0579°E，缩放级别 11
     map = L.map(mapContainer.value).setView([22.5431, 114.0579], 11);
@@ -530,8 +542,6 @@ onMounted(() => {
     
     L.control.layers({ "OpenStreetMap": baseLayer }, overlays).addTo(map);
 
-    generateMockAircraft();
-    
     // 计算浮窗的正中间位置
     const mainContent = document.querySelector('.main-content') as HTMLElement;
     if (mainContent) {
@@ -543,9 +553,17 @@ onMounted(() => {
         y: (rect.height - panelHeight) / 2
       };
     }
-    
-    // Simulation Loop (1Hz)
-    simulationInterval = window.setInterval(processSignal, 1000);
+
+    // 尝试启动 Rust 后端模拟
+    try {
+      await startRustSimulation();
+    } catch (e) {
+      // 如果 Tauri 不可用（浏览器运行），使用前端模拟
+      console.log('[Frontend] Tauri not available, using frontend simulation');
+      dataSource.value = 'frontend';
+      generateMockAircraft();
+      simulationInterval = window.setInterval(processSignal, 1000);
+    }
 
     // 添加鼠标事件监听（用于浮窗拖动）
     document.addEventListener('mousemove', onMouseMove);
@@ -553,10 +571,92 @@ onMounted(() => {
   }
 });
 
-onUnmounted(() => {
+// ==================== Tauri 后端通信 ====================
+
+interface TauriAircraft {
+  id: string;
+  callsign: string;
+  lat: number;
+  lng: number;
+  altitude: number;
+  speed: number;
+  heading: number;
+  nic: number;
+}
+
+interface AdsbBatchEvent {
+  messages: Array<{ hex_message: string; aircraft_id: string; message_type: string }>;
+  aircrafts: TauriAircraft[];
+  timestamp: number;
+}
+
+const startRustSimulation = async () => {
+  // 监听 Rust 后端的 ADS-B 数据事件
+  tauriUnlisten = await listen<AdsbBatchEvent>('adsb-batch', (event) => {
+    handleRustAdsbBatch(event.payload);
+  });
+
+  // 启动 Rust 后端模拟
+  await invoke('start_simulation', {
+    config: {
+      center_lat: 22.5431,
+      center_lng: 114.0579,
+      aircraft_count: 12,
+      update_interval_ms: 1000,
+    }
+  });
+
+  dataSource.value = 'backend';
+  logs.value.unshift('[System] 🦀 Using Rust backend for ADS-B simulation');
+};
+
+const stopRustSimulation = async () => {
+  try {
+    await invoke('stop_simulation');
+    if (tauriUnlisten) {
+      tauriUnlisten();
+      tauriUnlisten = null;
+    }
+    logs.value.unshift('[System] 🛑 Rust simulation stopped');
+  } catch (e) {
+    console.error('Failed to stop Rust simulation:', e);
+  }
+};
+
+const handleRustAdsbBatch = (batch: AdsbBatchEvent) => {
+  // 更新真实飞机数据（从 Rust 获取）
+  batch.aircrafts.forEach((aircraft) => {
+    truthAircrafts.value.set(aircraft.id, {
+      id: aircraft.id,
+      lat: aircraft.lat,
+      lng: aircraft.lng,
+      heading: aircraft.heading,
+      speed: aircraft.speed,
+      altitude: aircraft.altitude,
+      nic: aircraft.nic,
+      callsign: aircraft.callsign,
+      lastSeen: Date.now()
+    });
+  });
+
+  // 处理 ADS-B 消息
+  batch.messages.forEach((msg) => {
+    handleReceivedMessage(msg.hex_message);
+  });
+
+  updateMap();
+};
+
+onUnmounted(async () => {
   if (simulationInterval) {
     clearInterval(simulationInterval);
   }
+  
+  // 停止 Rust 后端模拟（如果正在运行）
+  if (dataSource.value === 'backend') {
+    await stopRustSimulation();
+  }
+  
   replayEngine.stop();
   // 移除鼠标事件监听
   document.removeEventListener('mousemove', onMouseMove);
@@ -745,13 +845,20 @@ const onSeekEnd = () => {
  */
 const onSeekInput = (event: Event) => {
   const input = event.target as HTMLInputElement;
-  const targetTime = parseFloat(input.value);
+  const progressValue = parseFloat(input.value);
   
-  // 更新回放引擎位置
-  replayEngine.seekTo(targetTime);
+  // 根据进度百分比计算目标时间（毫秒）
+  const targetTimeMs = (progressValue / 100) * playbackTotalTime.value;
+  
+  // 更新当前时间显示
+  playbackCurrentTime.value = targetTimeMs;
+  playbackProgress.value = progressValue;
+  
+  // 更新回放引擎位置（传入毫秒值）
+  replayEngine.seekTo(targetTimeMs);
   
   // 实时重建状态并更新轨迹显示
-  rebuildStateToTime(targetTime);
+  rebuildStateToTime(targetTimeMs);
 };
 
 /**
@@ -833,6 +940,33 @@ const isReplaying = computed(() => mode.value === 'replay');
 const canRecord = computed(() => mode.value === 'simulation');
 const canReplay = computed(() => mode.value !== 'recording');
 
+// 日期时间显示
+const currentTime = ref<string>('00:00:00');
+const currentDate = ref<string>('0000-00-00');
+
+const updateDateTime = () => {
+  const now = new Date();
+  currentTime.value = now.toLocaleTimeString('zh-CN', { hour12: false });
+  currentDate.value = now.toLocaleDateString('zh-CN');
+};
+
+// 雷达点位置计算
+const getRadarDotStyle = (plane: AircraftState, index: number) => {
+  // 将飞机位置映射到雷达圆内
+  const angle = (plane.heading + index * 45) * (Math.PI / 180);
+  const distance = 25 + Math.random() * 20; // 随机分布在圆内
+  return {
+    left: `${50 + Math.cos(angle) * distance}%`,
+    top: `${50 + Math.sin(angle) * distance}%`,
+    animationDelay: `${index * 0.2}s`
+  };
+};
+
+// 选择飞机
+const selectPlane = (id: string) => {
+  selectedPlaneId.value = id;
+};
+
 // 飞机列表计算属性（支持搜索过滤）
 const planesList = computed(() => {
   const planes: AircraftState[] = [];
@@ -900,186 +1034,272 @@ const onMouseUp = () => {
 </script>
 
 <template>
-  <div class="adsb-layout">
-    <!-- 侧边栏隐藏/显示按钮 -->
-    <button class="toggle-sidebar-btn" @click="showSidebar = !showSidebar" :title="showSidebar ? '隐藏菜单' : '显示菜单'">
-      {{ showSidebar ? '◀' : '▶' }}
-    </button>
-
-    <!-- 侧边栏菜单 -->
-    <aside v-show="showSidebar" class="sidebar">
-      <div class="logo-section">
-        <div class="logo">✈️ ADS-B</div>
-        <div class="version">v1.0</div>
+  <div class="radar-layout">
+    <!-- 顶部导航栏 -->
+    <header class="top-header">
+      <div class="header-left">
+        <div class="system-logo">
+          <span class="logo-icon">📡</span>
+          <span class="logo-text">ADS-B 雷达监控系统</span>
+        </div>
+        <div class="system-status">
+          <span class="status-dot online"></span>
+          <span>系统在线</span>
+        </div>
       </div>
-
-      <nav class="main-menu">
-        <button
-          :class="['menu-item', { active: activeMenu === 'planes' }]"
-          @click="activeMenu = 'planes'"
-        >
-          <span class="menu-icon">📡</span>
-          <span>飞机列表</span>
+      <nav class="header-nav">
+        <button :class="['nav-btn', { active: activeMenu === 'map' }]" @click="activeMenu = 'map'">
+          <span>📡</span> 态势显示
         </button>
-        <button
-          :class="['menu-item', { active: activeMenu === 'map' }]"
-          @click="activeMenu = 'map'"
-        >
-          <span class="menu-icon">🗺️</span>
-          <span>地图视图</span>
+        <button :class="['nav-btn', { active: activeMenu === 'planes' }]" @click="activeMenu = 'planes'">
+          <span>✈️</span> 目标列表
         </button>
-        <button
-          :class="['menu-item', { active: activeMenu === 'stats' }]"
-          @click="activeMenu = 'stats'"
-        >
-          <span class="menu-icon">📊</span>
-          <span>统计分析</span>
+        <button :class="['nav-btn', { active: activeMenu === 'stats' }]" @click="activeMenu = 'stats'">
+          <span>📊</span> 统计分析
         </button>
-        <button
-          class="menu-item"
-          @click="showReplayPanel = true"
-        >
-          <span class="menu-icon">▶️</span>
-          <span>数据回放</span>
+        <button class="nav-btn" @click="showReplayPanel = true">
+          <span>🎬</span> 数据回放
         </button>
       </nav>
-
-      <!-- 飞机列表视图 -->
-      <div v-if="activeMenu === 'planes'" class="menu-content planes-list">
-        <div class="search-box">
-          <input
-            v-model="searchQuery"
-            type="text"
-            placeholder="搜索航班号/ID..."
-            class="search-input"
-          />
+      <div class="header-right">
+        <div class="datetime">
+          <span class="date">{{ currentDate }}</span>
+          <span class="time">{{ currentTime }}</span>
         </div>
-        <div class="planes-container">
-          <div
-            v-for="plane in planesList"
-            :key="plane.id"
-            :class="['plane-item', { selected: selectedPlaneId === plane.id }]"
-            @click="selectedPlaneId = plane.id; activeMenu = 'map'"
-          >
-            <div class="plane-header">
-              <span class="callsign">{{ plane.callsign || plane.id }}</span>
-              <span :class="['status-badge', plane.nic >= 8 ? 'good' : plane.nic >= 4 ? 'medium' : 'poor']">
-                NIC: {{ plane.nic }}
-              </span>
-            </div>
-            <div class="plane-brief">
-              <div>🌍 {{ plane.lat.toFixed(2) }}, {{ plane.lng.toFixed(2) }}</div>
-              <div>📏 {{ plane.altitude.toFixed(0) }}m</div>
-              <div>💨 {{ plane.speed.toFixed(0) }} km/h</div>
-            </div>
-          </div>
-          <div v-if="planesList.length === 0" class="empty-state">
-            暂无飞机数据
-          </div>
+        <div class="data-source-badge">
+          <span class="badge" :class="dataSource">
+            {{ dataSource === 'backend' ? '🦀 Rust后端' : '📺 前端模拟' }}
+          </span>
         </div>
       </div>
-    </aside>
+    </header>
 
-    <!-- 主内容区 -->
-    <main class="main-content">
-      <!-- 地图视图 -->
-      <section v-show="activeMenu === 'map' || activeMenu === 'planes'" class="map-section">
-        <div ref="mapContainer" class="map-container"></div>
-
-        <!-- 飞机信息卡片 -->
-        <transition name="slide-up">
-          <div v-if="selectedPlane" class="plane-info-card">
-            <div class="card-header">
-              <span class="flight-number">{{ selectedPlane.callsign || selectedPlane.id }}</span>
-              <button class="close-btn" @click="selectedPlaneId = null">×</button>
+    <div class="main-body">
+      <!-- 左侧面板 -->
+      <aside class="left-panel" :class="{ collapsed: !showSidebar }">
+        <button class="panel-toggle left" @click="showSidebar = !showSidebar" :title="showSidebar ? '隐藏状态栏' : '显示状态栏'">
+          <span class="toggle-icon">{{ showSidebar ? '«' : '»' }}</span>
+        </button>
+        
+        <div v-show="showSidebar" class="panel-content">
+          <!-- 雷达状态信息 -->
+          <div class="info-block">
+            <div class="block-header">
+              <span class="header-icon">📡</span>
+              <span>雷达状态</span>
             </div>
-            <div class="card-body">
-              <div class="info-grid">
-                <div class="info-item">
-                  <label>ICAO ID</label>
-                  <span>{{ selectedPlane.id }}</span>
+            <div class="block-body">
+              <div class="info-row">
+                <span class="label">设备编号</span>
+                <span class="value">ADS-B/SZ-001</span>
+              </div>
+              <div class="info-row">
+                <span class="label">位置</span>
+                <span class="value">22.54°N, 114.06°E</span>
+              </div>
+              <div class="info-row">
+                <span class="label">探测范围</span>
+                <span class="value">450km</span>
+              </div>
+              <div class="info-row">
+                <span class="label">更新频率</span>
+                <span class="value">1Hz</span>
+              </div>
+              <div class="info-row">
+                <span class="label">数据源</span>
+                <span class="value highlight">{{ dataSource === 'backend' ? 'Rust后端' : '前端模拟' }}</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- 雷达扫描仪表盘 -->
+          <div class="info-block">
+            <div class="block-header">
+              <span class="header-icon">🎯</span>
+              <span>扫描状态</span>
+            </div>
+            <div class="radar-gauge">
+              <div class="radar-circle">
+                <div class="radar-sweep"></div>
+                <div class="radar-center"></div>
+                <div class="radar-rings">
+                  <div class="ring"></div>
+                  <div class="ring"></div>
+                  <div class="ring"></div>
                 </div>
-                <div class="info-item">
-                  <label>航班号</label>
-                  <span>{{ selectedPlane.callsign }}</span>
+                <div class="radar-targets">
+                  <div v-for="(plane, index) in planesList.slice(0, 8)" :key="plane.id" 
+                       class="target-dot" 
+                       :style="getRadarDotStyle(plane, index)">
+                  </div>
                 </div>
-                <div class="info-item">
-                  <label>经度</label>
-                  <span>{{ selectedPlane.lng.toFixed(6) }}</span>
+              </div>
+              <div class="gauge-info">
+                <div class="gauge-item">
+                  <span class="gauge-value">{{ aircrafts.size }}</span>
+                  <span class="gauge-label">目标数量</span>
                 </div>
-                <div class="info-item">
-                  <label>纬度</label>
-                  <span>{{ selectedPlane.lat.toFixed(6) }}</span>
-                </div>
-                <div class="info-item">
-                  <label>高度</label>
-                  <span>{{ selectedPlane.altitude.toFixed(0) }} m</span>
-                </div>
-                <div class="info-item">
-                  <label>速度</label>
-                  <span>{{ selectedPlane.speed.toFixed(0) }} km/h</span>
-                </div>
-                <div class="info-item">
-                  <label>航向</label>
-                  <span>{{ selectedPlane.heading.toFixed(0) }}°</span>
-                </div>
-                <div class="info-item">
-                  <label>信号质量</label>
-                  <span :class="['nic-value', selectedPlane.nic >= 8 ? 'good' : selectedPlane.nic >= 4 ? 'medium' : 'poor']">
-                    {{ selectedPlane.nic }}/11
-                  </span>
+                <div class="gauge-item">
+                  <span class="gauge-value">{{ planesList.filter(p => p.nic >= 8).length }}</span>
+                  <span class="gauge-label">高精度</span>
                 </div>
               </div>
             </div>
           </div>
-        </transition>
-      </section>
 
-      <!-- 统计分析视图 -->
-      <section v-show="activeMenu === 'stats'" class="stats-section">
-        <div class="section-header">📊 统计分析</div>
-        <div class="stats-grid">
-          <div class="stat-card">
-            <div class="stat-value">{{ aircrafts.size }}</div>
-            <div class="stat-label">在线飞机</div>
+          <!-- 选中飞机详细信息 -->
+          <div v-if="selectedPlane" class="info-block aircraft-detail">
+            <div class="block-header">
+              <span class="header-icon">✈️</span>
+              <span>目标详情</span>
+              <button class="close-detail" @click="selectedPlaneId = null">×</button>
+            </div>
+            <div class="aircraft-visual">
+              <div class="aircraft-icon-large">✈️</div>
+              <div class="aircraft-callsign">{{ selectedPlane.callsign || selectedPlane.id }}</div>
+            </div>
+            <div class="aircraft-params">
+              <div class="param-row">
+                <div class="param">
+                  <span class="param-label">ICAO</span>
+                  <span class="param-value">{{ selectedPlane.id }}</span>
+                </div>
+                <div class="param">
+                  <span class="param-label">航班号</span>
+                  <span class="param-value">{{ selectedPlane.callsign }}</span>
+                </div>
+              </div>
+              <div class="param-row">
+                <div class="param">
+                  <span class="param-label">高度</span>
+                  <span class="param-value">{{ selectedPlane.altitude.toFixed(0) }}<small>m</small></span>
+                </div>
+                <div class="param">
+                  <span class="param-label">速度</span>
+                  <span class="param-value">{{ selectedPlane.speed.toFixed(0) }}<small>km/h</small></span>
+                </div>
+              </div>
+              <div class="param-row">
+                <div class="param">
+                  <span class="param-label">航向</span>
+                  <span class="param-value">{{ selectedPlane.heading.toFixed(0) }}<small>°</small></span>
+                </div>
+                <div class="param">
+                  <span class="param-label">NIC</span>
+                  <span class="param-value" :class="['nic', selectedPlane.nic >= 8 ? 'good' : selectedPlane.nic >= 4 ? 'medium' : 'poor']">
+                    {{ selectedPlane.nic }}/11
+                  </span>
+                </div>
+              </div>
+              <div class="param-row full">
+                <div class="param">
+                  <span class="param-label">经纬度</span>
+                  <span class="param-value small">{{ selectedPlane.lat.toFixed(4) }}°N, {{ selectedPlane.lng.toFixed(4) }}°E</span>
+                </div>
+              </div>
+            </div>
           </div>
-          <div class="stat-card">
-            <div class="stat-value">{{ planesList.filter(p => p.nic >= 8).length }}</div>
-            <div class="stat-label">高质量信号</div>
-          </div>
-          <div class="stat-card">
-            <div class="stat-value">{{ logs.length }}</div>
-            <div class="stat-label">事件日志</div>
+
+          <!-- 目标列表 -->
+          <div class="info-block target-list">
+            <div class="block-header">
+              <span class="header-icon">📋</span>
+              <span>监测目标 ({{ aircrafts.size }})</span>
+            </div>
+            <div class="search-box">
+              <input v-model="searchQuery" type="text" placeholder="🔍 搜索航班号/ID..." class="search-input" />
+            </div>
+            <div class="targets-scroll">
+              <div v-for="(plane, index) in planesList" :key="plane.id" 
+                   :class="['target-item', { selected: selectedPlaneId === plane.id }]"
+                   @click="selectPlane(plane.id)">
+                <span class="target-index">{{ (index + 1).toString().padStart(2, '0') }}</span>
+                <div class="target-icon">✈️</div>
+                <div class="target-info">
+                  <div class="target-name">{{ plane.callsign || plane.id }}</div>
+                  <div class="target-details">
+                    {{ plane.altitude.toFixed(0) }}m · {{ plane.speed.toFixed(0) }}km/h · {{ plane.heading.toFixed(0) }}°
+                  </div>
+                </div>
+                <div :class="['target-nic', plane.nic >= 8 ? 'good' : plane.nic >= 4 ? 'medium' : 'poor']">
+                  {{ plane.nic }}
+                </div>
+              </div>
+              <div v-if="planesList.length === 0" class="empty-state">暂无目标数据</div>
+            </div>
           </div>
         </div>
-      </section>
+      </aside>
 
-      <!-- 系统设置视图 -->
-      <section v-show="activeMenu === 'stats'" class="stats-section">
-        <div class="section-header">📊 统计分析</div>
-        <div class="stats-grid">
-          <div class="stat-card">
-            <div class="stat-value">{{ aircrafts.size }}</div>
-            <div class="stat-label">在线飞机</div>
-          </div>
-          <div class="stat-card">
-            <div class="stat-value">{{ planesList.filter(p => p.nic >= 8).length }}</div>
-            <div class="stat-label">高质量信号</div>
-          </div>
-          <div class="stat-card">
-            <div class="stat-value">{{ logs.length }}</div>
-            <div class="stat-label">事件日志</div>
+      <!-- 中央地图区域 -->
+      <main class="map-area">
+        <div ref="mapContainer" class="map-container"></div>
+        
+        <!-- 地图覆盖层信息 -->
+        <div class="map-overlay top-left">
+          <div class="overlay-info">
+            <span class="label">探测区域</span>
+            <span class="value">深圳空域</span>
           </div>
         </div>
-      </section>
-    </main>
 
-    <!-- 数据回放模态窗口 -->
+        <!-- 统计面板（覆盖在地图上） -->
+        <div v-if="activeMenu === 'stats'" class="stats-overlay">
+          <div class="stats-panel">
+            <h3>📊 实时统计分析</h3>
+            <div class="stats-grid">
+              <div class="stat-item">
+                <div class="stat-icon">✈️</div>
+                <div class="stat-value">{{ aircrafts.size }}</div>
+                <div class="stat-label">在线目标</div>
+              </div>
+              <div class="stat-item">
+                <div class="stat-icon">📶</div>
+                <div class="stat-value">{{ planesList.filter(p => p.nic >= 8).length }}</div>
+                <div class="stat-label">高精度信号</div>
+              </div>
+              <div class="stat-item">
+                <div class="stat-icon">⚠️</div>
+                <div class="stat-value">{{ planesList.filter(p => p.nic < 4).length }}</div>
+                <div class="stat-label">低质量信号</div>
+              </div>
+              <div class="stat-item">
+                <div class="stat-icon">📝</div>
+                <div class="stat-value">{{ logs.length }}</div>
+                <div class="stat-label">消息记录</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </main>
+
+      <!-- 右侧日志面板 -->
+      <aside class="right-panel" :class="{ collapsed: !showLogs }">
+        <button class="panel-toggle right" @click="showLogs = !showLogs" :title="showLogs ? '隐藏日志' : '显示日志'">
+          <span class="toggle-icon">{{ showLogs ? '»' : '«' }}</span>
+        </button>
+        
+        <div v-show="showLogs" class="panel-content">
+          <div class="info-block logs-block">
+            <div class="block-header">
+              <span class="header-icon">📝</span>
+              <span>系统日志</span>
+            </div>
+            <div ref="logContainer" class="logs-scroll">
+              <div v-for="(log, index) in logs" :key="index" class="log-item">
+                {{ log }}
+              </div>
+            </div>
+          </div>
+        </div>
+      </aside>
+    </div>
+
     <!-- 数据回放浮窗 -->
-    <div v-if="showReplayPanel" class="replay-panel" :style="{ left: replayPanelPosition.x + 'px', top: replayPanelPosition.y + 'px' }" @mousedown="onReplayPanelMouseDown">
-      <div class="replay-panel-header">
+    <div v-if="showReplayPanel" class="replay-panel" :style="{ left: replayPanelPosition.x + 'px', top: replayPanelPosition.y + 'px' }">
+      <div class="replay-panel-header" @mousedown="onReplayPanelMouseDown">
         <h3>🎬 数据回放控制</h3>
-        <button class="close-btn" @click="showReplayPanel = false">✕</button>
+        <button class="close-btn" @click.stop="showReplayPanel = false">×</button>
       </div>
       <div class="replay-panel-body">
         <!-- 模式指示 -->
@@ -1122,16 +1342,17 @@ const onMouseUp = () => {
             </button>
           </div>
 
-          <div class="progress-control">
+          <div class="progress-control" @mousedown.stop>
             <div class="time-display">
               {{ formatTime(playbackCurrentTime) }} / {{ formatTime(playbackTotalTime) }}
             </div>
             <input
               type="range"
               class="progress-slider"
-              :value="playbackProgress"
+              v-model.number="playbackProgress"
               min="0"
               max="100"
+              step="0.1"
               @mousedown="onSeekStart"
               @mouseup="onSeekEnd"
               @input="onSeekInput"
@@ -1159,21 +1380,6 @@ const onMouseUp = () => {
         </div>
       </div>
     </div>
-
-    <!-- 日志面板隐藏/显示按钮 -->
-    <button class="toggle-logs-btn" @click="showLogs = !showLogs" :title="showLogs ? '隐藏日志' : '显示日志'">
-      {{ showLogs ? '▶' : '◀' }}
-    </button>
-
-    <!-- 日志面板 -->
-    <aside v-show="showLogs" class="log-panel">
-      <h3>📝 日志</h3>
-      <div ref="logContainer" class="logs">
-        <div v-for="(log, index) in logs" :key="index" class="log-entry">
-          {{ log }}
-        </div>
-      </div>
-    </aside>
   </div>
 </template>
 
@@ -1185,95 +1391,446 @@ const onMouseUp = () => {
 </style>
 
 <style scoped>
-/* ==================== 模态窗口 ==================== */
-.modal-overlay {
-  position: fixed;
-  top: 0;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  background: rgba(0, 0, 0, 0.5);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 2000;
+/* ==================== 深色科技风格主题变量 ==================== */
+:root {
+  --bg-primary: #0a0e17;
+  --bg-secondary: #0d1321;
+  --bg-tertiary: #131b2e;
+  --bg-card: #1a2332;
+  --border-color: #1e3a5f;
+  --border-glow: #00d4ff;
+  --text-primary: #e0e6ed;
+  --text-secondary: #8892a0;
+  --text-muted: #5a6270;
+  --accent-cyan: #00d4ff;
+  --accent-blue: #0080ff;
+  --accent-green: #00ff88;
+  --accent-orange: #ff9500;
+  --accent-red: #ff4757;
+  --glow-cyan: 0 0 20px rgba(0, 212, 255, 0.3);
+  --glow-green: 0 0 15px rgba(0, 255, 136, 0.3);
 }
 
-.modal-content {
-  background: #fff;
-  border-radius: 12px;
-  box-shadow: 0 8px 48px rgba(0, 0, 0, 0.25);
-  width: 90%;
-  max-width: 500px;
-  max-height: 80vh;
+/* ==================== 整体布局 ==================== */
+.radar-layout {
   display: flex;
   flex-direction: column;
+  width: 100vw;
+  height: 100vh;
+  background: linear-gradient(135deg, #0a0e17 0%, #0d1321 50%, #131b2e 100%);
+  font-family: 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  color: #e0e6ed;
   overflow: hidden;
 }
 
-.modal-header {
+/* ==================== 顶部导航栏 ==================== */
+.top-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 24px;
+  height: 60px;
+  background: linear-gradient(180deg, rgba(13, 19, 33, 0.98) 0%, rgba(10, 14, 23, 0.95) 100%);
+  border-bottom: 1px solid #1e3a5f;
+  box-shadow: 0 2px 20px rgba(0, 0, 0, 0.5), inset 0 -1px 0 rgba(0, 212, 255, 0.1);
+  z-index: 100;
+}
+
+.header-left {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+}
+
+.system-logo {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.logo-icon {
+  font-size: 24px;
+  filter: drop-shadow(0 0 8px rgba(0, 212, 255, 0.6));
+}
+
+.logo-text {
+  font-size: 18px;
+  font-weight: 600;
+  background: linear-gradient(90deg, #00d4ff, #0080ff);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  letter-spacing: 2px;
+}
+
+.system-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: #8892a0;
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #00ff88;
+  box-shadow: 0 0 10px rgba(0, 255, 136, 0.6);
+  animation: pulse-dot 2s infinite;
+}
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.6; transform: scale(1.2); }
+}
+
+.header-nav {
+  display: flex;
+  gap: 8px;
+}
+
+.nav-btn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 20px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: #8892a0;
+  font-size: 13px;
+  cursor: pointer;
+  transition: all 0.3s ease;
+}
+
+.nav-btn:hover {
+  background: rgba(0, 212, 255, 0.1);
+  border-color: rgba(0, 212, 255, 0.3);
+  color: #e0e6ed;
+}
+
+.nav-btn.active {
+  background: linear-gradient(135deg, rgba(0, 212, 255, 0.2) 0%, rgba(0, 128, 255, 0.1) 100%);
+  border-color: #00d4ff;
+  color: #00d4ff;
+  box-shadow: 0 0 15px rgba(0, 212, 255, 0.2), inset 0 0 15px rgba(0, 212, 255, 0.05);
+}
+
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+}
+
+.datetime {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  font-family: 'Consolas', 'Courier New', monospace;
+}
+
+.datetime .date {
+  font-size: 11px;
+  color: #5a6270;
+}
+
+.datetime .time {
+  font-size: 18px;
+  font-weight: 600;
+  color: #00d4ff;
+  text-shadow: 0 0 10px rgba(0, 212, 255, 0.5);
+}
+
+.data-source-badge .badge {
+  padding: 6px 12px;
+  border-radius: 20px;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.data-source-badge .badge.backend {
+  background: linear-gradient(135deg, #ff6b35 0%, #f7931e 100%);
+  color: white;
+  box-shadow: 0 0 15px rgba(247, 147, 30, 0.4);
+}
+
+.data-source-badge .badge.frontend {
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: white;
+}
+
+/* ==================== 主体区域 ==================== */
+.main-body {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+}
+
+/* ==================== 左侧面板 ==================== */
+.left-panel {
+  position: relative;
+  width: 320px;
+  background: linear-gradient(180deg, rgba(13, 19, 33, 0.95) 0%, rgba(10, 14, 23, 0.98) 100%);
+  border-right: 1px solid #1e3a5f;
+  display: flex;
+  flex-direction: column;
+  transition: width 0.3s ease, margin-left 0.3s ease;
+  overflow: visible;
+  z-index: 1000;
+}
+
+.left-panel.collapsed {
+  width: 0;
+  margin-left: -1px;
+}
+
+.panel-toggle {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 24px;
+  height: 80px;
+  background: linear-gradient(180deg, rgba(0, 60, 100, 0.95) 0%, rgba(0, 40, 80, 0.98) 100%);
+  border: 2px solid #00d4ff;
+  color: #00d4ff;
+  font-size: 18px;
+  font-weight: bold;
+  cursor: pointer;
+  z-index: 2000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.3s ease;
+  box-shadow: 0 0 15px rgba(0, 212, 255, 0.5), inset 0 0 10px rgba(0, 212, 255, 0.1);
+}
+
+.panel-toggle .toggle-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-shadow: 0 0 8px rgba(0, 212, 255, 0.8);
+}
+
+.panel-toggle.left {
+  right: -24px;
+  border-radius: 0 8px 8px 0;
+  border-left: none;
+}
+
+.panel-toggle.right {
+  left: -24px;
+  border-radius: 8px 0 0 8px;
+  border-right: none;
+}
+
+.panel-toggle:hover {
+  background: linear-gradient(180deg, rgba(0, 100, 150, 0.95) 0%, rgba(0, 60, 100, 0.98) 100%);
+  color: #fff;
+  box-shadow: 0 0 20px rgba(0, 212, 255, 0.6);
+  transform: translateY(-50%) scale(1.05);
+}
+
+.panel-toggle:active {
+  transform: translateY(-50%) scale(0.95);
+}
+
+.panel-content {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  background: inherit;
+}
+
+/* 自定义滚动条 */
+.panel-content::-webkit-scrollbar,
+.targets-scroll::-webkit-scrollbar,
+.logs-scroll::-webkit-scrollbar {
+  width: 6px;
+}
+
+.panel-content::-webkit-scrollbar-track,
+.targets-scroll::-webkit-scrollbar-track,
+.logs-scroll::-webkit-scrollbar-track {
+  background: rgba(0, 0, 0, 0.2);
+  border-radius: 3px;
+}
+
+.panel-content::-webkit-scrollbar-thumb,
+.targets-scroll::-webkit-scrollbar-thumb,
+.logs-scroll::-webkit-scrollbar-thumb {
+  background: linear-gradient(180deg, #00d4ff 0%, #0080ff 100%);
+  border-radius: 3px;
+}
+
+/* ==================== 信息块样式 ==================== */
+.info-block {
+  background: linear-gradient(135deg, rgba(26, 35, 50, 0.8) 0%, rgba(13, 19, 33, 0.9) 100%);
+  border: 1px solid #1e3a5f;
+  border-radius: 8px;
+  overflow: hidden;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+}
+
+.block-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 16px;
+  background: linear-gradient(90deg, rgba(0, 212, 255, 0.1) 0%, transparent 100%);
+  border-bottom: 1px solid #1e3a5f;
+  font-size: 13px;
+  font-weight: 600;
+  color: #00d4ff;
+}
+
+.header-icon {
+  font-size: 16px;
+}
+
+.block-body {
+  padding: 12px 16px;
+}
+
+.info-row {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 24px 28px;
-  border-bottom: 1px solid #e8eef5;
-  background: #f6f8fa;
+  padding: 8px 0;
+  border-bottom: 1px solid rgba(30, 58, 95, 0.5);
 }
 
-.modal-header h2 {
-  margin: 0;
-  font-size: 18px;
-  color: #232f3e;
+.info-row:last-child {
+  border-bottom: none;
 }
 
-.modal-close-btn {
-  background: none;
-  border: none;
+.info-row .label {
+  font-size: 12px;
+  color: #5a6270;
+}
+
+.info-row .value {
+  font-size: 13px;
+  color: #e0e6ed;
+  font-family: 'Consolas', monospace;
+}
+
+.info-row .value.highlight {
+  color: #00ff88;
+  text-shadow: 0 0 8px rgba(0, 255, 136, 0.5);
+}
+
+/* ==================== 雷达仪表盘 ==================== */
+.radar-gauge {
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+}
+
+.radar-circle {
+  position: relative;
+  width: 120px;
+  height: 120px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(0, 212, 255, 0.1) 0%, transparent 70%);
+  border: 2px solid #1e3a5f;
+  overflow: hidden;
+}
+
+.radar-sweep {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 50%;
+  height: 2px;
+  background: linear-gradient(90deg, #00d4ff, transparent);
+  transform-origin: left center;
+  animation: radar-sweep 3s linear infinite;
+  box-shadow: 0 0 20px rgba(0, 212, 255, 0.8);
+}
+
+@keyframes radar-sweep {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.radar-center {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 8px;
+  height: 8px;
+  background: #00d4ff;
+  border-radius: 50%;
+  transform: translate(-50%, -50%);
+  box-shadow: 0 0 10px rgba(0, 212, 255, 0.8);
+}
+
+.radar-rings .ring {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  border: 1px solid rgba(0, 212, 255, 0.2);
+  border-radius: 50%;
+  transform: translate(-50%, -50%);
+}
+
+.radar-rings .ring:nth-child(1) { width: 40px; height: 40px; }
+.radar-rings .ring:nth-child(2) { width: 70px; height: 70px; }
+.radar-rings .ring:nth-child(3) { width: 100px; height: 100px; }
+
+.target-dot {
+  position: absolute;
+  width: 6px;
+  height: 6px;
+  background: #00ff88;
+  border-radius: 50%;
+  box-shadow: 0 0 8px rgba(0, 255, 136, 0.8);
+  animation: blink 1.5s infinite;
+}
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+.gauge-info {
+  display: flex;
+  gap: 24px;
+}
+
+.gauge-item {
+  text-align: center;
+}
+
+.gauge-value {
+  display: block;
   font-size: 24px;
-  color: #888;
-  cursor: pointer;
-  transition: color 0.2s;
+  font-weight: 700;
+  color: #00d4ff;
+  text-shadow: 0 0 10px rgba(0, 212, 255, 0.5);
 }
 
-.modal-close-btn:hover {
-  color: #232f3e;
+.gauge-label {
+  font-size: 11px;
+  color: #5a6270;
 }
 
-.modal-body {
-  padding: 24px 28px;
-  overflow-y: auto;
-  flex: 1;
-}
-
-/* 过渡动画 */
-.modal-enter-active,
-.modal-leave-active {
-  transition: opacity 0.3s ease;
-}
-
-.modal-enter-from,
-.modal-leave-to {
-  opacity: 0;
-}
-
-.modal-enter-active .modal-content,
-.modal-leave-active .modal-content {
-  transition: transform 0.3s ease;
-}
-
-.modal-enter-from .modal-content,
-.modal-leave-to .modal-content {
-  transform: scale(0.95);
-}
-
-/* ==================== 浮窗面板 ==================== */
+/* ==================== 浮窗面板（深色科技风） ==================== */
 .replay-panel {
   position: fixed;
-  background: #fff;
+  background: linear-gradient(135deg, rgba(13, 19, 33, 0.98) 0%, rgba(10, 14, 23, 0.98) 100%);
+  border: 1px solid #1e3a5f;
   border-radius: 12px;
-  box-shadow: 0 8px 48px rgba(0, 0, 0, 0.25);
+  box-shadow: 0 8px 48px rgba(0, 0, 0, 0.5), 0 0 30px rgba(0, 212, 255, 0.1);
   width: 90%;
-  max-width: 500px;
+  max-width: 480px;
   max-height: 80vh;
   display: flex;
   flex-direction: column;
@@ -1286,31 +1843,26 @@ const onMouseUp = () => {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 20px 24px;
-  border-bottom: 1px solid #e8eef5;
-  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-  color: white;
+  padding: 16px 20px;
+  border-bottom: 1px solid #1e3a5f;
+  background: linear-gradient(90deg, rgba(0, 212, 255, 0.15) 0%, rgba(0, 128, 255, 0.1) 100%);
   cursor: move;
-  transition: background 0.3s;
-}
-
-.replay-panel-header:hover {
-  background: linear-gradient(135deg, #5568d3 0%, #673a8e 100%);
 }
 
 .replay-panel-header h3 {
   margin: 0;
-  font-size: 18px;
+  font-size: 16px;
+  color: #00d4ff;
   flex: 1;
 }
 
 .replay-panel-header .close-btn {
   background: none;
   border: none;
-  font-size: 24px;
-  color: #fff;
+  font-size: 20px;
+  color: #5a6270;
   cursor: pointer;
-  transition: opacity 0.2s;
+  transition: all 0.2s;
   padding: 0;
   width: 24px;
   height: 24px;
@@ -1320,13 +1872,14 @@ const onMouseUp = () => {
 }
 
 .replay-panel-header .close-btn:hover {
-  opacity: 0.8;
+  color: #ff4757;
 }
 
 .replay-panel-body {
-  padding: 24px 28px;
+  padding: 20px;
   overflow-y: auto;
   flex: 1;
+  background: rgba(10, 14, 23, 0.5);
 }
 
 .replay-panel.dragging {
@@ -1337,263 +1890,220 @@ const onMouseUp = () => {
   cursor: grabbing !important;
 }
 
-/* ==================== 整体布局 ==================== */
-.adsb-layout {
-  display: flex;
-  width: 100vw;
-  height: 100vh;
-  background: #f6f8fa;
-  font-family: 'Segoe UI', 'PingFang SC', Arial, sans-serif;
-  position: relative;
-}
-
-/* ==================== 隐藏/显示按钮 ==================== */
-.toggle-sidebar-btn {
-  position: absolute;
-  left: 0;
-  top: 50%;
-  transform: translateY(-50%);
-  width: 24px;
-  height: 48px;
-  background: #409eff;
-  border: none;
-  color: white;
-  font-size: 14px;
-  cursor: pointer;
-  z-index: 999;
-  transition: all 0.3s;
-  border-radius: 0 6px 6px 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 0;
-}
-
-.toggle-sidebar-btn:hover {
-  background: #66b1ff;
-  width: 28px;
-}
-
-.toggle-logs-btn {
-  position: absolute;
-  right: 0;
-  top: 50%;
-  transform: translateY(-50%);
-  width: 24px;
-  height: 48px;
-  background: #409eff;
-  border: none;
-  color: white;
-  font-size: 14px;
-  cursor: pointer;
-  z-index: 999;
-  transition: all 0.3s;
-  border-radius: 6px 0 0 6px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 0;
-}
-
-.toggle-logs-btn:hover {
-  background: #66b1ff;
-  width: 28px;
-}
-
-/* ==================== 侧边栏 ==================== */
-.sidebar {
-  width: 320px;
-  background: #1e2139;
-  color: #fff;
-  display: flex;
-  flex-direction: column;
-  border-right: 1px solid #2a3148;
-  overflow: hidden;
-  transition: margin-left 0.3s ease, opacity 0.3s ease;
-}
-
-.logo-section {
-  padding: 24px 20px;
-  border-bottom: 1px solid #2a3148;
-  text-align: center;
-}
-
-.logo {
-  font-size: 1.8rem;
-  font-weight: bold;
-  letter-spacing: 2px;
-  margin-bottom: 6px;
-}
-
-.version {
-  font-size: 12px;
-  color: #888;
-}
-
-.main-menu {
-  display: flex;
-  flex-direction: column;
-  padding: 12px 0;
-  border-bottom: 1px solid #2a3148;
-}
-
-.menu-item {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 14px 20px;
-  background: none;
-  border: none;
-  color: #a0aec0;
-  cursor: pointer;
-  transition: all 0.2s;
-  font-size: 14px;
-}
-
-.menu-item:hover {
-  background: rgba(255, 255, 255, 0.05);
-  color: #fff;
-}
-
-.menu-item.active {
-  background: rgba(65, 157, 255, 0.15);
-  color: #409eff;
-  border-left: 4px solid #409eff;
-  padding-left: 16px;
-}
-
-.menu-icon {
-  font-size: 18px;
-}
-
-/* ==================== 菜单内容区 ==================== */
-.menu-content {
+/* ==================== 目标列表样式 ==================== */
+.target-list {
   flex: 1;
-  overflow-y: auto;
-  padding: 16px;
-}
-
-/* ==================== 飞机列表 ==================== */
-.planes-list {
   display: flex;
   flex-direction: column;
+  min-height: 200px;
 }
 
 .search-box {
-  margin-bottom: 16px;
+  padding: 12px 16px;
+  border-bottom: 1px solid #1e3a5f;
 }
 
 .search-input {
   width: 100%;
-  padding: 10px 12px;
-  background: #2a3148;
-  border: 1px solid #3a4560;
+  padding: 10px 14px;
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid #1e3a5f;
   border-radius: 6px;
-  color: #fff;
+  color: #e0e6ed;
   font-size: 13px;
-  transition: all 0.2s;
+  transition: all 0.3s;
 }
 
 .search-input::placeholder {
-  color: #666;
+  color: #5a6270;
 }
 
 .search-input:focus {
   outline: none;
-  border-color: #409eff;
-  background: #323d54;
+  border-color: #00d4ff;
+  box-shadow: 0 0 15px rgba(0, 212, 255, 0.2);
 }
 
-.planes-container {
+.targets-scroll {
   flex: 1;
   overflow-y: auto;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
+  padding: 8px;
+  max-height: 300px;
 }
 
-.plane-item {
-  padding: 12px;
-  background: #2a3148;
-  border: 2px solid transparent;
-  border-radius: 8px;
+.target-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  margin-bottom: 6px;
+  background: rgba(0, 0, 0, 0.2);
+  border: 1px solid transparent;
+  border-radius: 6px;
   cursor: pointer;
   transition: all 0.2s;
 }
 
-.plane-item:hover {
-  background: #323d54;
-  border-color: #409eff;
+.target-item:hover {
+  background: rgba(0, 212, 255, 0.1);
+  border-color: rgba(0, 212, 255, 0.3);
 }
 
-.plane-item.selected {
-  background: rgba(65, 157, 255, 0.2);
-  border-color: #409eff;
+.target-item.selected {
+  background: rgba(0, 212, 255, 0.15);
+  border-color: #00d4ff;
+  box-shadow: 0 0 15px rgba(0, 212, 255, 0.2);
 }
 
-.plane-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-bottom: 8px;
+.target-index {
+  font-size: 11px;
+  color: #5a6270;
+  font-family: 'Consolas', monospace;
+  min-width: 20px;
 }
 
-.callsign {
+.target-icon {
+  font-size: 16px;
+}
+
+.target-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.target-name {
+  font-size: 13px;
   font-weight: 600;
-  color: #fff;
-  font-size: 14px;
+  color: #e0e6ed;
+  margin-bottom: 2px;
 }
 
-.status-badge {
-  padding: 2px 8px;
+.target-details {
+  font-size: 11px;
+  color: #5a6270;
+  font-family: 'Consolas', monospace;
+}
+
+.target-nic {
+  padding: 3px 8px;
   border-radius: 4px;
   font-size: 11px;
-  font-weight: 500;
+  font-weight: 600;
 }
 
-.status-badge.good {
-  background: rgba(76, 175, 80, 0.3);
-  color: #4caf50;
+.target-nic.good {
+  background: rgba(0, 255, 136, 0.2);
+  color: #00ff88;
 }
 
-.status-badge.medium {
-  background: rgba(255, 152, 0, 0.3);
-  color: #ff9800;
+.target-nic.medium {
+  background: rgba(255, 149, 0, 0.2);
+  color: #ff9500;
 }
 
-.status-badge.poor {
-  background: rgba(244, 67, 54, 0.3);
-  color: #f44336;
-}
-
-.plane-brief {
-  font-size: 12px;
-  color: #a0aec0;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
+.target-nic.poor {
+  background: rgba(255, 71, 87, 0.2);
+  color: #ff4757;
 }
 
 .empty-state {
   text-align: center;
-  color: #666;
+  color: #5a6270;
   padding: 40px 20px;
-  font-size: 14px;
+  font-size: 13px;
 }
 
-/* ==================== 主内容区 ==================== */
-.main-content {
-  flex: 1;
+/* ==================== 飞机详情面板 ==================== */
+.aircraft-detail .close-detail {
+  margin-left: auto;
+  background: none;
+  border: none;
+  color: #5a6270;
+  font-size: 18px;
+  cursor: pointer;
+  transition: color 0.2s;
+}
+
+.aircraft-detail .close-detail:hover {
+  color: #ff4757;
+}
+
+.aircraft-visual {
+  text-align: center;
+  padding: 16px;
+  border-bottom: 1px solid #1e3a5f;
+}
+
+.aircraft-icon-large {
+  font-size: 48px;
+  margin-bottom: 8px;
+  filter: drop-shadow(0 0 10px rgba(0, 212, 255, 0.5));
+}
+
+.aircraft-callsign {
+  font-size: 18px;
+  font-weight: 700;
+  color: #00d4ff;
+  letter-spacing: 2px;
+}
+
+.aircraft-params {
+  padding: 12px 16px;
+}
+
+.param-row {
   display: flex;
-  flex-direction: column;
-  background: #fff;
-  position: relative;
-  overflow: hidden;
+  gap: 12px;
+  margin-bottom: 10px;
 }
 
-.map-section {
+.param-row.full .param {
+  flex: 1;
+}
+
+.param {
+  flex: 1;
+  background: rgba(0, 0, 0, 0.2);
+  padding: 10px 12px;
+  border-radius: 6px;
+  border: 1px solid #1e3a5f;
+}
+
+.param-label {
+  display: block;
+  font-size: 10px;
+  color: #5a6270;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  margin-bottom: 4px;
+}
+
+.param-value {
+  font-size: 15px;
+  font-weight: 600;
+  color: #e0e6ed;
+  font-family: 'Consolas', monospace;
+}
+
+.param-value small {
+  font-size: 11px;
+  color: #5a6270;
+  margin-left: 2px;
+}
+
+.param-value.small {
+  font-size: 12px;
+}
+
+.param-value.nic.good { color: #00ff88; }
+.param-value.nic.medium { color: #ff9500; }
+.param-value.nic.poor { color: #ff4757; }
+
+/* ==================== 地图区域 ==================== */
+.map-area {
   flex: 1;
   position: relative;
+  background: #0a0e17;
 }
 
 .map-container {
@@ -1601,227 +2111,201 @@ const onMouseUp = () => {
   height: 100%;
 }
 
-/* ==================== 飞机信息卡片 ==================== */
-.plane-info-card {
+.map-overlay {
   position: absolute;
-  bottom: 20px;
-  right: 20px;
-  width: 360px;
-  background: #fff;
-  border-radius: 12px;
-  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.15);
-  z-index: 1000;
-  overflow: hidden;
-  animation: slideUp 0.3s ease-out;
+  z-index: 500;
+  padding: 8px 12px;
+  background: rgba(10, 14, 23, 0.85);
+  border: 1px solid #1e3a5f;
+  border-radius: 6px;
+  backdrop-filter: blur(10px);
 }
 
-@keyframes slideUp {
-  from {
-    transform: translateY(40px);
-    opacity: 0;
-  }
-  to {
-    transform: translateY(0);
-    opacity: 1;
-  }
+.map-overlay.top-left {
+  top: 16px;
+  left: 16px;
 }
 
-.slide-up-enter-active,
-.slide-up-leave-active {
-  transition: all 0.3s ease;
+.map-overlay.top-right {
+  top: 16px;
+  right: 16px;
 }
 
-.slide-up-enter-from,
-.slide-up-leave-to {
-  transform: translateY(40px);
-  opacity: 0;
-}
-
-.card-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 16px 20px;
-  background: #f6f8fa;
-  border-bottom: 1px solid #e8eef5;
-}
-
-.flight-number {
-  font-size: 16px;
-  font-weight: 600;
-  color: #232f3e;
-}
-
-.close-btn {
-  background: none;
-  border: none;
-  font-size: 24px;
-  color: #888;
-  cursor: pointer;
-  transition: color 0.2s;
-}
-
-.close-btn:hover {
-  color: #232f3e;
-}
-
-.card-body {
-  padding: 16px 20px;
-  max-height: 400px;
-  overflow-y: auto;
-}
-
-.info-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 12px;
-}
-
-.info-item {
-  display: flex;
-  flex-direction: column;
-}
-
-.info-item label {
-  font-size: 12px;
-  color: #888;
-  font-weight: 500;
-  margin-bottom: 4px;
+.overlay-info .label {
+  font-size: 10px;
+  color: #5a6270;
   text-transform: uppercase;
-  letter-spacing: 0.5px;
 }
 
-.info-item span {
+.overlay-info .value {
   font-size: 13px;
-  color: #232f3e;
-  font-weight: 500;
-  font-family: 'Courier New', monospace;
-}
-
-.nic-value {
-  padding: 2px 6px;
-  border-radius: 4px;
-  display: inline-block;
-  width: fit-content;
-}
-
-.nic-value.good {
-  background: rgba(76, 175, 80, 0.1);
-  color: #4caf50;
-}
-
-.nic-value.medium {
-  background: rgba(255, 152, 0, 0.1);
-  color: #ff9800;
-}
-
-.nic-value.poor {
-  background: rgba(244, 67, 54, 0.1);
-  color: #f44336;
-}
-
-/* ==================== 统计分析视图 ==================== */
-.stats-section {
-  flex: 1;
-  padding: 32px;
-  overflow-y: auto;
-}
-
-.section-header {
-  font-size: 24px;
+  color: #00d4ff;
   font-weight: 600;
-  color: #232f3e;
-  margin-bottom: 24px;
-  border-bottom: 2px solid #409eff;
-  padding-bottom: 12px;
+}
+
+/* ==================== 统计面板覆盖层 ==================== */
+.stats-overlay {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 600;
+}
+
+.stats-panel {
+  background: rgba(10, 14, 23, 0.95);
+  border: 1px solid #1e3a5f;
+  border-radius: 12px;
+  padding: 24px;
+  min-width: 400px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5), 0 0 40px rgba(0, 212, 255, 0.1);
+}
+
+.stats-panel h3 {
+  margin: 0 0 20px 0;
+  color: #00d4ff;
+  font-size: 18px;
+  text-align: center;
 }
 
 .stats-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-  gap: 20px;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 16px;
 }
 
-.stat-card {
-  padding: 24px;
-  background: #f6f8fa;
-  border-radius: 12px;
+.stat-item {
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid #1e3a5f;
+  border-radius: 8px;
+  padding: 16px;
   text-align: center;
-  border: 1px solid #e8eef5;
+  transition: all 0.3s;
 }
 
-.stat-value {
-  font-size: 36px;
-  font-weight: 700;
-  color: #409eff;
+.stat-item:hover {
+  border-color: #00d4ff;
+  box-shadow: 0 0 20px rgba(0, 212, 255, 0.2);
+}
+
+.stat-icon {
+  font-size: 24px;
   margin-bottom: 8px;
 }
 
-.stat-label {
-  font-size: 14px;
-  color: #666;
+.stat-value {
+  font-size: 28px;
+  font-weight: 700;
+  color: #00d4ff;
+  text-shadow: 0 0 15px rgba(0, 212, 255, 0.5);
+  margin-bottom: 4px;
 }
 
-/* ==================== 控制组和状态指示 ==================== */
+.stat-label {
+  font-size: 12px;
+  color: #5a6270;
+}
+
+/* ==================== 右侧日志面板 ==================== */
+.right-panel {
+  position: relative;
+  width: 300px;
+  background: linear-gradient(180deg, rgba(13, 19, 33, 0.95) 0%, rgba(10, 14, 23, 0.98) 100%);
+  border-left: 1px solid #1e3a5f;
+  display: flex;
+  flex-direction: column;
+  transition: width 0.3s ease, margin-right 0.3s ease;
+  z-index: 1000;
+}
+
+.right-panel.collapsed {
+  width: 0;
+  margin-right: -1px;
+}
+
+.logs-block {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+
+.logs-scroll {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px;
+  font-family: 'Consolas', 'Courier New', monospace;
+  font-size: 11px;
+  background: rgba(0, 0, 0, 0.3);
+  max-height: calc(100vh - 200px);
+}
+
+.log-item {
+  padding: 4px 0;
+  color: #00ff88;
+  border-bottom: 1px solid rgba(30, 58, 95, 0.3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ==================== 控制组和状态指示（深色风格） ==================== */
 .mode-indicator {
   margin-bottom: 16px;
 }
 
 .badge {
   display: inline-block;
-  padding: 6px 12px;
+  padding: 6px 14px;
   border-radius: 20px;
-  font-size: 13px;
-  font-weight: bold;
+  font-size: 12px;
+  font-weight: 600;
 }
 
 .badge-simulation {
-  background: #4caf50;
-  color: white;
+  background: rgba(0, 255, 136, 0.2);
+  color: #00ff88;
+  border: 1px solid rgba(0, 255, 136, 0.3);
 }
 
 .badge-recording {
-  background: #f44336;
-  color: white;
-  animation: pulse 1.5s infinite;
+  background: rgba(255, 71, 87, 0.2);
+  color: #ff4757;
+  border: 1px solid rgba(255, 71, 87, 0.3);
+  animation: pulse-recording 1.5s infinite;
 }
 
 .badge-replay {
-  background: #2196f3;
-  color: white;
+  background: rgba(0, 212, 255, 0.2);
+  color: #00d4ff;
+  border: 1px solid rgba(0, 212, 255, 0.3);
 }
 
-@keyframes pulse {
-  0%, 100% {
-    opacity: 1;
-  }
-  50% {
-    opacity: 0.6;
-  }
-}
-
-.modal-body h5 {
-  font-size: 13px;
-  font-weight: 600;
-  color: #666;
-  text-transform: uppercase;
-  letter-spacing: 1px;
-  margin-top: 0;
-  margin-bottom: 10px;
+@keyframes pulse-recording {
+  0%, 100% { opacity: 1; box-shadow: 0 0 10px rgba(255, 71, 87, 0.5); }
+  50% { opacity: 0.7; box-shadow: 0 0 20px rgba(255, 71, 87, 0.8); }
 }
 
 .control-group {
   margin-bottom: 20px;
-  padding-bottom: 20px;
-  border-bottom: 1px solid #e8eef5;
+  padding-bottom: 16px;
+  border-bottom: 1px solid #1e3a5f;
+}
+
+.control-group h5 {
+  font-size: 12px;
+  font-weight: 600;
+  color: #5a6270;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  margin: 0 0 12px 0;
 }
 
 .btn {
   padding: 10px 16px;
-  margin: 5px 5px 5px 0;
-  border: none;
+  margin: 4px 4px 4px 0;
+  border: 1px solid transparent;
   border-radius: 6px;
-  font-size: 14px;
+  font-size: 13px;
   cursor: pointer;
   transition: all 0.3s;
   font-weight: 500;
@@ -1829,66 +2313,69 @@ const onMouseUp = () => {
 
 .btn:hover:not(:disabled) {
   transform: translateY(-2px);
-  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
 }
 
 .btn:disabled {
-  opacity: 0.5;
+  opacity: 0.4;
   cursor: not-allowed;
 }
 
 .btn-start {
-  background: #f44336;
+  background: linear-gradient(135deg, #ff4757 0%, #ff6b6b 100%);
   color: white;
   width: 100%;
+  box-shadow: 0 4px 15px rgba(255, 71, 87, 0.3);
+}
+
+.btn-start:hover:not(:disabled) {
+  box-shadow: 0 6px 20px rgba(255, 71, 87, 0.5);
 }
 
 .btn-stop {
-  background: #ff9800;
+  background: linear-gradient(135deg, #ff9500 0%, #ffb347 100%);
   color: white;
 }
 
 .btn-download {
-  background: #4caf50;
-  color: white;
+  background: linear-gradient(135deg, #00ff88 0%, #00d68f 100%);
+  color: #0a0e17;
 }
 
 .btn-load {
-  background: #2196f3;
+  background: linear-gradient(135deg, #00d4ff 0%, #0080ff 100%);
   color: white;
   width: 100%;
 }
 
 .btn-play {
-  background: #4caf50;
-  color: white;
+  background: linear-gradient(135deg, #00ff88 0%, #00d68f 100%);
+  color: #0a0e17;
 }
 
 .btn-pause {
-  background: #ff9800;
+  background: linear-gradient(135deg, #ff9500 0%, #ffb347 100%);
   color: white;
 }
 
 .btn-back {
-  background: #9e9e9e;
-  color: white;
+  background: rgba(90, 98, 112, 0.5);
+  color: #e0e6ed;
+  border: 1px solid #5a6270;
 }
 
-.recording-controls,
-.replay-controls {
+.recording-controls {
   display: flex;
-  flex-direction: column;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 .button-row {
   display: flex;
-  flex-wrap: wrap;
-  gap: 5px;
+  gap: 8px;
 }
 
 .button-row .btn {
   flex: 1;
-  min-width: 100px;
   margin: 0;
 }
 
@@ -1901,15 +2388,15 @@ const onMouseUp = () => {
 }
 
 .speed-control label {
-  font-size: 13px;
-  color: #666;
+  font-size: 12px;
+  color: #5a6270;
 }
 
 .btn-speed {
   padding: 6px 12px;
-  background: #f6f8fa;
-  color: #666;
-  border: 1px solid #e8eef5;
+  background: rgba(0, 0, 0, 0.3);
+  color: #8892a0;
+  border: 1px solid #1e3a5f;
   border-radius: 4px;
   font-size: 12px;
   cursor: pointer;
@@ -1917,14 +2404,15 @@ const onMouseUp = () => {
 }
 
 .btn-speed:hover {
-  background: #e8eef5;
+  background: rgba(0, 212, 255, 0.1);
+  border-color: rgba(0, 212, 255, 0.3);
 }
 
 .btn-speed.active {
-  background: #409eff;
-  border-color: #409eff;
+  background: linear-gradient(135deg, #00d4ff 0%, #0080ff 100%);
+  border-color: #00d4ff;
   color: white;
-  font-weight: bold;
+  box-shadow: 0 0 15px rgba(0, 212, 255, 0.4);
 }
 
 .progress-control {
@@ -1933,17 +2421,30 @@ const onMouseUp = () => {
 
 .time-display {
   font-size: 13px;
-  color: #666;
+  color: #00d4ff;
   margin-bottom: 8px;
   text-align: center;
-  font-family: 'Courier New', monospace;
+  font-family: 'Consolas', monospace;
 }
 
 .progress-slider {
   width: 100%;
-  margin-bottom: 10px;
-  cursor: pointer;
   height: 6px;
+  cursor: pointer;
+  -webkit-appearance: none;
+  background: #1e3a5f;
+  border-radius: 3px;
+  outline: none;
+}
+
+.progress-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 16px;
+  height: 16px;
+  background: #00d4ff;
+  border-radius: 50%;
+  cursor: pointer;
+  box-shadow: 0 0 10px rgba(0, 212, 255, 0.5);
 }
 
 .trajectory-toggle {
@@ -1952,7 +2453,7 @@ const onMouseUp = () => {
   gap: 8px;
   margin-top: 12px;
   font-size: 13px;
-  color: #666;
+  color: #8892a0;
   cursor: pointer;
   user-select: none;
 }
@@ -1961,100 +2462,76 @@ const onMouseUp = () => {
   width: 16px;
   height: 16px;
   cursor: pointer;
-  accent-color: #409eff;
-}
-
-.trajectory-toggle span {
-  transition: color 0.2s;
+  accent-color: #00d4ff;
 }
 
 .trajectory-toggle:hover span {
-  color: #232f3e;
-}
-
-/* ==================== 日志面板 ==================== */
-.log-panel {
-  width: 280px;
-  background: #1e1e1e;
-  color: #00ff00;
-  font-family: 'Courier New', Courier, monospace;
-  display: flex;
-  flex-direction: column;
-  border-left: 1px solid #333;
-  transition: margin-right 0.3s ease, opacity 0.3s ease;
-}
-
-.log-panel h3 {
-  padding: 12px 16px;
-  margin: 0;
-  background: #2d2d2d;
-  font-size: 14px;
-  color: #fff;
-  border-bottom: 1px solid #333;
-}
-
-.logs {
-  flex: 1;
-  overflow-y: auto;
-  padding: 12px;
-  font-size: 12px;
-}
-
-.log-entry {
-  margin-bottom: 4px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  color: #e0e6ed;
 }
 
 /* ==================== 响应式设计 ==================== */
 @media (max-width: 1200px) {
-  .sidebar {
+  .left-panel {
     width: 280px;
   }
-
-  .plane-info-card {
-    width: 300px;
+  
+  .right-panel {
+    width: 260px;
   }
 }
 
 @media (max-width: 900px) {
-  .adsb-layout {
+  .radar-layout {
     flex-direction: column;
   }
-
-  .sidebar {
+  
+  .top-header {
+    flex-wrap: wrap;
+    height: auto;
+    padding: 12px;
+  }
+  
+  .header-nav {
+    order: 3;
     width: 100%;
-    max-height: 200px;
+    justify-content: center;
+    margin-top: 10px;
+  }
+  
+  .main-body {
+    flex-direction: column;
+  }
+  
+  .left-panel {
+    width: 100%;
+    max-height: 40vh;
     border-right: none;
-    border-bottom: 1px solid #2a3148;
+    border-bottom: 1px solid #1e3a5f;
   }
-
-  .main-menu {
-    flex-direction: row;
-    overflow-x: auto;
-  }
-
-  .menu-item {
-    white-space: nowrap;
-    flex-shrink: 0;
-  }
-
-  .main-content {
-    flex: 1;
-  }
-
-  .log-panel {
+  
+  .right-panel {
     width: 100%;
-    max-height: 150px;
+    max-height: 30vh;
     border-left: none;
-    border-top: 1px solid #333;
+    border-top: 1px solid #1e3a5f;
   }
-
-  .plane-info-card {
-    width: 95%;
-    right: 10px;
-    left: 10px;
+  
+  .panel-toggle.left {
+    display: none;
+  }
+  
+  .panel-toggle.right {
+    display: none;
+  }
+  
+  .stats-panel {
+    min-width: auto;
+    width: 90%;
+    max-width: 400px;
+  }
+  
+  .stats-grid {
+    grid-template-columns: repeat(2, 1fr);
   }
 }
 </style>
