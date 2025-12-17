@@ -278,11 +278,17 @@ export class ReplayEngine {
     const wasPlaying = this.state === 'playing';
     
     if (wasPlaying) {
-      // 保存当前进度
-      const currentProgress = Date.now() - this.playbackStartTime;
+      // 计算当前的回放时间（已经乘过旧速度的时间）
+      const currentPlaybackTime = (Date.now() - this.playbackStartTime) * this.playbackSpeed;
+      // 更新速度
       this.playbackSpeed = speed;
-      // 调整起始时间以保持进度一致
-      this.playbackStartTime = Date.now() - currentProgress;
+      // 反算新的起始时间，使得 currentPlaybackTime 保持不变
+      // currentPlaybackTime = (Date.now() - newStartTime) * newSpeed
+      // newStartTime = Date.now() - currentPlaybackTime / newSpeed
+      this.playbackStartTime = Date.now() - currentPlaybackTime / speed;
+    } else if (this.state === 'paused') {
+      // 暂停状态下，pausedAt 已经是回放时间，不需要调整
+      this.playbackSpeed = speed;
     } else {
       this.playbackSpeed = speed;
     }

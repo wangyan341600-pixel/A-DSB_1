@@ -13,6 +13,18 @@ const aircrafts = ref<Map<string, AircraftState>>(new Map());
 const markers = ref<Map<string, L.Marker>>(new Map());
 const logs = ref<string[]>([]);
 
+// UI菜单状态
+const activeMenu = ref<'planes' | 'map' | 'stats'>('planes');
+const selectedPlaneId = ref<string | null>(null);
+const searchQuery = ref<string>('');
+const showSidebar = ref<boolean>(true);  // 控制侧边栏显示
+const showLogs = ref<boolean>(true);     // 控制日志面板显示
+const showReplayPanel = ref<boolean>(false); // 控制数据回放浮窗显示
+const replayPanelPosition = ref({ x: 50, y: 50 }); // 浮窗位置
+const isDraggingReplayPanel = ref<boolean>(false); // 是否正在拖动浮窗
+const mouseDownPos = ref({ x: 0, y: 0 }); // 鼠标按下时的绝对坐标
+const panelStartPos = ref({ x: 0, y: 0 }); // 浮窗开始拖动时的位置
+
 let map: L.Map | null = null;
 let heatmapLayer: any = null;
 let aircraftLayer: L.LayerGroup | null = null;
@@ -173,21 +185,36 @@ const createPlaneIcon = (heading: number, nic: number) => {
 };
 
 const generateMockAircraft = () => {
-  const count = 10;
-  const centerLat = 39.9042;
-  const centerLng = 116.4074;
+  const count = 12;
+  // 深圳坐标中心：22.5431°N, 114.0579°E
+  const centerLat = 22.5431;
+  const centerLng = 114.0579;
+
+  // 真实的国内航空公司航班前缀和真实航班号
+  const airlines = [
+    { prefix: 'CZ', name: '中国南方航空' },      // China Southern
+    { prefix: 'CA', name: '中国国际航空' },      // Air China
+    { prefix: 'MU', name: '中国东方航空' },      // China Eastern
+    { prefix: 'BZ', name: '中国海南航空' },      // Hainan Airlines
+    { prefix: 'FM', name: '上海虹桥航空' },      // Shanghai Airlines
+    { prefix: 'ZH', name: '深圳航空' },          // Shenzhen Airlines
+  ];
 
   for (let i = 0; i < count; i++) {
-    const id = (0x780000 + i).toString(16).toUpperCase(); // Fake ICAO
-    truthAircrafts.value.set(id, {
-      id,
-      lat: centerLat + (Math.random() - 0.5) * 0.8,
-      lng: centerLng + (Math.random() - 0.5) * 0.8,
+    const icaoId = (0x780000 + i).toString(16).toUpperCase(); // Fake ICAO
+    const airline = airlines[i % airlines.length];
+    const flightNum = String(1000 + Math.floor(Math.random() * 8000)).substring(0, 4);
+    const callsign = `${airline.prefix}${flightNum}`;
+
+    truthAircrafts.value.set(icaoId, {
+      id: icaoId,
+      lat: centerLat + (Math.random() - 0.5) * 1.2,
+      lng: centerLng + (Math.random() - 0.5) * 1.2,
       heading: Math.random() * 360,
-      speed: 200 + Math.random() * 300,
-      altitude: 10000 + Math.random() * 20000,
-      nic: Math.floor(Math.random() * 12), // Random GNSS Quality 0-11
-      callsign: `CA${1000 + i}`,
+      speed: 400 + Math.random() * 250,  // 更现实的巡航速度
+      altitude: 5000 + Math.random() * 10000,  // 更低的高度范围（起降相关）
+      nic: Math.floor(Math.random() * 12),
+      callsign: callsign,
       lastSeen: Date.now()
     });
   }
@@ -241,9 +268,13 @@ const handleReceivedMessage = (hex: string, eventTimestamp?: number) => {
     
     let state = aircrafts.value.get(icao);
     if (!state) {
+      // 从真实飞机数据中获取航班号
+      const truthAircraft = truthAircrafts.value.get(icao);
+      const callsign = truthAircraft?.callsign || 'Unknown';
+      
       state = {
         id: icao,
-        lat: 0, lng: 0, heading: 0, speed: 0, altitude: 0, nic: 0, callsign: 'Unknown', lastSeen: 0
+        lat: 0, lng: 0, heading: 0, speed: 0, altitude: 0, nic: 0, callsign: callsign, lastSeen: 0
       };
       aircrafts.value.set(icao, state);
     }
@@ -470,7 +501,8 @@ const updateMap = (replayTargetTime?: number) => {
 
 onMounted(() => {
   if (mapContainer.value) {
-    map = L.map(mapContainer.value).setView([39.9042, 116.4074], 9);
+    // 深圳坐标：22.5431°N, 114.0579°E，缩放级别 11
+    map = L.map(mapContainer.value).setView([22.5431, 114.0579], 11);
 
     // Layer 1: Base Map
     const baseLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
@@ -500,8 +532,24 @@ onMounted(() => {
 
     generateMockAircraft();
     
+    // 计算浮窗的正中间位置
+    const mainContent = document.querySelector('.main-content') as HTMLElement;
+    if (mainContent) {
+      const rect = mainContent.getBoundingClientRect();
+      const panelWidth = 500; // 浮窗标准宽度
+      const panelHeight = 400; // 浮窗标准高度
+      replayPanelPosition.value = {
+        x: (rect.width - panelWidth) / 2,
+        y: (rect.height - panelHeight) / 2
+      };
+    }
+    
     // Simulation Loop (1Hz)
     simulationInterval = window.setInterval(processSignal, 1000);
+
+    // 添加鼠标事件监听（用于浮窗拖动）
+    document.addEventListener('mousemove', onMouseMove);
+    document.addEventListener('mouseup', onMouseUp);
   }
 });
 
@@ -510,6 +558,9 @@ onUnmounted(() => {
     clearInterval(simulationInterval);
   }
   replayEngine.stop();
+  // 移除鼠标事件监听
+  document.removeEventListener('mousemove', onMouseMove);
+  document.removeEventListener('mouseup', onMouseUp);
 });
 
 // ==================== 录制与回放控制函数 ====================
@@ -769,130 +820,360 @@ const formatTime = (ms: number): string => {
   return `${minutes}:${seconds.toString().padStart(2, '0')}`;
 };
 
+/**
+ * 触发文件输入
+ */
+const triggerFileInput = () => {
+  fileInputRef.value?.click();
+};
+
 // Computed properties
 const isRecording = computed(() => mode.value === 'recording');
 const isReplaying = computed(() => mode.value === 'replay');
 const canRecord = computed(() => mode.value === 'simulation');
 const canReplay = computed(() => mode.value !== 'recording');
+
+// 飞机列表计算属性（支持搜索过滤）
+const planesList = computed(() => {
+  const planes: AircraftState[] = [];
+  aircrafts.value.forEach((aircraft) => {
+    planes.push(aircraft);
+  });
+  
+  if (searchQuery.value.trim()) {
+    const query = searchQuery.value.toLowerCase();
+    return planes.filter(p => 
+      (p.callsign && p.callsign.toLowerCase().includes(query)) ||
+      p.id.toLowerCase().includes(query)
+    );
+  }
+  
+  return planes.sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0));
+});
+
+// 当前选中的飞机
+const selectedPlane = computed(() => {
+  if (!selectedPlaneId.value) return null;
+  return aircrafts.value.get(selectedPlaneId.value) || null;
+});
+
+// 浮窗拖动相关函数
+const onReplayPanelMouseDown = (event: MouseEvent) => {
+  // 点击浮窗任意位置都可以拖动
+  isDraggingReplayPanel.value = true;
+  // 记录鼠标按下时的绝对坐标
+  mouseDownPos.value = { x: event.clientX, y: event.clientY };
+  // 记录浮窗当前的位置
+  panelStartPos.value = { x: replayPanelPosition.value.x, y: replayPanelPosition.value.y };
+};
+
+const onMouseMove = (event: MouseEvent) => {
+  if (isDraggingReplayPanel.value) {
+    const panel = document.querySelector('.replay-panel') as HTMLElement;
+    
+    if (panel) {
+      const panelRect = panel.getBoundingClientRect();
+      
+      // 计算鼠标移动的距离
+      const deltaX = event.clientX - mouseDownPos.value.x;
+      const deltaY = event.clientY - mouseDownPos.value.y;
+      
+      // 新位置 = 起始位置 + 移动距离
+      const newX = panelStartPos.value.x + deltaX;
+      const newY = panelStartPos.value.y + deltaY;
+      
+      // 限制浮窗在视口范围内
+      const maxX = window.innerWidth - panelRect.width;
+      const maxY = window.innerHeight - panelRect.height;
+      
+      replayPanelPosition.value = {
+        x: Math.max(0, Math.min(newX, maxX)),
+        y: Math.max(0, Math.min(newY, maxY))
+      };
+    }
+  }
+};
+
+const onMouseUp = () => {
+  isDraggingReplayPanel.value = false;
+};
 </script>
 
 <template>
-  <div class="container">
-    <div ref="mapContainer" class="map-container"></div>
-    
-    <!-- 控制面板 -->
-    <div class="control-panel">
-      <h3>🎬 数据回放控制</h3>
-      
-      <!-- 模式指示 -->
-      <div class="mode-indicator">
-        <span v-if="mode === 'simulation'" class="badge badge-simulation">🟢 模拟模式</span>
-        <span v-else-if="mode === 'recording'" class="badge badge-recording">🔴 正在录制</span>
-        <span v-else-if="mode === 'replay'" class="badge badge-replay">▶️ 回放模式</span>
+  <div class="adsb-layout">
+    <!-- 侧边栏隐藏/显示按钮 -->
+    <button class="toggle-sidebar-btn" @click="showSidebar = !showSidebar" :title="showSidebar ? '隐藏菜单' : '显示菜单'">
+      {{ showSidebar ? '◀' : '▶' }}
+    </button>
+
+    <!-- 侧边栏菜单 -->
+    <aside v-show="showSidebar" class="sidebar">
+      <div class="logo-section">
+        <div class="logo">✈️ ADS-B</div>
+        <div class="version">v1.0</div>
       </div>
 
-      <!-- 录制控制 -->
-      <div v-if="!isReplaying" class="control-group">
-        <h4>📹 录制</h4>
-        <button v-if="!isRecording" @click="startRecording" :disabled="!canRecord" class="btn btn-start">
-          🔴 开始录制
+      <nav class="main-menu">
+        <button
+          :class="['menu-item', { active: activeMenu === 'planes' }]"
+          @click="activeMenu = 'planes'"
+        >
+          <span class="menu-icon">📡</span>
+          <span>飞机列表</span>
         </button>
-        <div v-else class="recording-controls">
-          <button @click="stopRecording" class="btn btn-stop">⏹️ 停止录制</button>
-          <button @click="downloadRecording" class="btn btn-download">💾 停止并下载</button>
+        <button
+          :class="['menu-item', { active: activeMenu === 'map' }]"
+          @click="activeMenu = 'map'"
+        >
+          <span class="menu-icon">🗺️</span>
+          <span>地图视图</span>
+        </button>
+        <button
+          :class="['menu-item', { active: activeMenu === 'stats' }]"
+          @click="activeMenu = 'stats'"
+        >
+          <span class="menu-icon">📊</span>
+          <span>统计分析</span>
+        </button>
+        <button
+          class="menu-item"
+          @click="showReplayPanel = true"
+        >
+          <span class="menu-icon">▶️</span>
+          <span>数据回放</span>
+        </button>
+      </nav>
+
+      <!-- 飞机列表视图 -->
+      <div v-if="activeMenu === 'planes'" class="menu-content planes-list">
+        <div class="search-box">
+          <input
+            v-model="searchQuery"
+            type="text"
+            placeholder="搜索航班号/ID..."
+            class="search-input"
+          />
+        </div>
+        <div class="planes-container">
+          <div
+            v-for="plane in planesList"
+            :key="plane.id"
+            :class="['plane-item', { selected: selectedPlaneId === plane.id }]"
+            @click="selectedPlaneId = plane.id; activeMenu = 'map'"
+          >
+            <div class="plane-header">
+              <span class="callsign">{{ plane.callsign || plane.id }}</span>
+              <span :class="['status-badge', plane.nic >= 8 ? 'good' : plane.nic >= 4 ? 'medium' : 'poor']">
+                NIC: {{ plane.nic }}
+              </span>
+            </div>
+            <div class="plane-brief">
+              <div>🌍 {{ plane.lat.toFixed(2) }}, {{ plane.lng.toFixed(2) }}</div>
+              <div>📏 {{ plane.altitude.toFixed(0) }}m</div>
+              <div>💨 {{ plane.speed.toFixed(0) }} km/h</div>
+            </div>
+          </div>
+          <div v-if="planesList.length === 0" class="empty-state">
+            暂无飞机数据
+          </div>
         </div>
       </div>
+    </aside>
 
-      <!-- 回放控制 -->
-      <div class="control-group">
-        <h4>▶️ 回放</h4>
-        
-        <!-- 文件加载 -->
-        <div v-if="!isReplaying" class="file-upload">
-          <input 
-            ref="fileInputRef" 
-            type="file" 
-            accept=".json" 
-            @change="loadRecordingFile" 
-            style="display: none"
-          />
-          <button @click="fileInputRef?.click()" :disabled="!canReplay" class="btn btn-load">
-            📂 加载录制文件
-          </button>
+    <!-- 主内容区 -->
+    <main class="main-content">
+      <!-- 地图视图 -->
+      <section v-show="activeMenu === 'map' || activeMenu === 'planes'" class="map-section">
+        <div ref="mapContainer" class="map-container"></div>
+
+        <!-- 飞机信息卡片 -->
+        <transition name="slide-up">
+          <div v-if="selectedPlane" class="plane-info-card">
+            <div class="card-header">
+              <span class="flight-number">{{ selectedPlane.callsign || selectedPlane.id }}</span>
+              <button class="close-btn" @click="selectedPlaneId = null">×</button>
+            </div>
+            <div class="card-body">
+              <div class="info-grid">
+                <div class="info-item">
+                  <label>ICAO ID</label>
+                  <span>{{ selectedPlane.id }}</span>
+                </div>
+                <div class="info-item">
+                  <label>航班号</label>
+                  <span>{{ selectedPlane.callsign }}</span>
+                </div>
+                <div class="info-item">
+                  <label>经度</label>
+                  <span>{{ selectedPlane.lng.toFixed(6) }}</span>
+                </div>
+                <div class="info-item">
+                  <label>纬度</label>
+                  <span>{{ selectedPlane.lat.toFixed(6) }}</span>
+                </div>
+                <div class="info-item">
+                  <label>高度</label>
+                  <span>{{ selectedPlane.altitude.toFixed(0) }} m</span>
+                </div>
+                <div class="info-item">
+                  <label>速度</label>
+                  <span>{{ selectedPlane.speed.toFixed(0) }} km/h</span>
+                </div>
+                <div class="info-item">
+                  <label>航向</label>
+                  <span>{{ selectedPlane.heading.toFixed(0) }}°</span>
+                </div>
+                <div class="info-item">
+                  <label>信号质量</label>
+                  <span :class="['nic-value', selectedPlane.nic >= 8 ? 'good' : selectedPlane.nic >= 4 ? 'medium' : 'poor']">
+                    {{ selectedPlane.nic }}/11
+                  </span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </transition>
+      </section>
+
+      <!-- 统计分析视图 -->
+      <section v-show="activeMenu === 'stats'" class="stats-section">
+        <div class="section-header">📊 统计分析</div>
+        <div class="stats-grid">
+          <div class="stat-card">
+            <div class="stat-value">{{ aircrafts.size }}</div>
+            <div class="stat-label">在线飞机</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-value">{{ planesList.filter(p => p.nic >= 8).length }}</div>
+            <div class="stat-label">高质量信号</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-value">{{ logs.length }}</div>
+            <div class="stat-label">事件日志</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 系统设置视图 -->
+      <section v-show="activeMenu === 'stats'" class="stats-section">
+        <div class="section-header">📊 统计分析</div>
+        <div class="stats-grid">
+          <div class="stat-card">
+            <div class="stat-value">{{ aircrafts.size }}</div>
+            <div class="stat-label">在线飞机</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-value">{{ planesList.filter(p => p.nic >= 8).length }}</div>
+            <div class="stat-label">高质量信号</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-value">{{ logs.length }}</div>
+            <div class="stat-label">事件日志</div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- 数据回放模态窗口 -->
+    <!-- 数据回放浮窗 -->
+    <div v-if="showReplayPanel" class="replay-panel" :style="{ left: replayPanelPosition.x + 'px', top: replayPanelPosition.y + 'px' }" @mousedown="onReplayPanelMouseDown">
+      <div class="replay-panel-header">
+        <h3>🎬 数据回放控制</h3>
+        <button class="close-btn" @click="showReplayPanel = false">✕</button>
+      </div>
+      <div class="replay-panel-body">
+        <!-- 模式指示 -->
+        <div class="mode-indicator">
+          <span v-if="mode === 'simulation'" class="badge badge-simulation">🟢 模拟模式</span>
+          <span v-else-if="mode === 'recording'" class="badge badge-recording">🔴 正在录制</span>
+          <span v-else-if="mode === 'replay'" class="badge badge-replay">▶️ 回放模式</span>
         </div>
 
-        <!-- 回放控制按钮 -->
-        <div v-else class="replay-controls">
+        <!-- 录制控制 -->
+        <div v-if="!isReplaying" class="control-group">
+          <h5>📹 录制</h5>
+          <button v-if="!isRecording" @click="startRecording" :disabled="!canRecord" class="btn btn-start">
+            🔴 开始录制
+          </button>
+          <div v-else class="recording-controls">
+            <button @click="stopRecording" class="btn btn-stop">⏹️ 停止录制</button>
+            <button @click="downloadRecording" class="btn btn-download">⬇️ 下载数据</button>
+          </div>
+        </div>
+
+        <!-- 回放控制 -->
+        <div v-if="mode === 'replay'" class="control-group">
+          <h5>▶️ 回放</h5>
           <div class="button-row">
-            <button 
-              v-if="playbackState !== 'playing'" 
-              @click="playReplay" 
-              class="btn btn-play"
-            >
-              ▶️ 播放
-            </button>
-            <button 
-              v-else 
-              @click="pauseReplay" 
-              class="btn btn-pause"
-            >
-              ⏸️ 暂停
-            </button>
-            <button @click="stopReplay" class="btn btn-stop">⏹️ 停止</button>
-            <button @click="backToSimulation" class="btn btn-back">🔄 返回模拟</button>
+            <button v-if="playbackState !== 'playing'" @click="playReplay" class="btn btn-play">▶️ 播放</button>
+            <button v-else @click="pauseReplay" class="btn btn-pause">⏸️ 暂停</button>
+            <button @click="stopReplay" class="btn btn-back">⏹️ 停止</button>
           </div>
 
-          <!-- 播放速度控制 -->
           <div class="speed-control">
-            <label>速度:</label>
-            <button 
-              v-for="speed in [0.5, 1, 2, 4]" 
+            <label>播放速度：</label>
+            <button
+              v-for="speed in [0.5, 1.0, 2.0, 4.0]"
               :key="speed"
-              @click="changeSpeed(speed)"
               :class="['btn-speed', { active: playbackSpeed === speed }]"
+              @click="changeSpeed(speed)"
             >
               {{ speed }}x
             </button>
           </div>
 
-          <!-- 进度条 -->
           <div class="progress-control">
             <div class="time-display">
               {{ formatTime(playbackCurrentTime) }} / {{ formatTime(playbackTotalTime) }}
             </div>
-            <input 
-              type="range" 
-              :min="0" 
-              :max="playbackTotalTime" 
-              :value="playbackCurrentTime"
-              @input="onSeekInput"
+            <input
+              type="range"
+              class="progress-slider"
+              :value="playbackProgress"
+              min="0"
+              max="100"
               @mousedown="onSeekStart"
               @mouseup="onSeekEnd"
-              @touchstart="onSeekStart"
-              @touchend="onSeekEnd"
-              class="progress-slider"
+              @input="onSeekInput"
             />
-            <div class="progress-bar">
-              <div class="progress-fill" :style="{ width: (playbackProgress * 100) + '%' }"></div>
-            </div>
-            
-            <!-- 轨迹显示控制 -->
-            <label class="trajectory-toggle">
-              <input type="checkbox" v-model="showTrajectory" @change="toggleTrajectory" />
-              <span>📍 显示飞行轨迹</span>
-            </label>
           </div>
+
+          <label class="trajectory-toggle">
+            <input v-model="showTrajectory" type="checkbox" @change="toggleTrajectory" />
+            <span>显示飞行轨迹</span>
+          </label>
+        </div>
+
+        <!-- 文件操作 -->
+        <div class="control-group">
+          <h5>📁 文件</h5>
+          <button v-if="canRecord" @click="downloadRecording" class="btn btn-download">⬇️ 下载录制</button>
+          <button @click="triggerFileInput" class="btn btn-load">⬆️ 加载录制</button>
+          <input
+            ref="fileInputRef"
+            type="file"
+            accept=".json"
+            style="display: none"
+            @change="loadRecordingFile"
+          />
         </div>
       </div>
     </div>
 
+    <!-- 日志面板隐藏/显示按钮 -->
+    <button class="toggle-logs-btn" @click="showLogs = !showLogs" :title="showLogs ? '隐藏日志' : '显示日志'">
+      {{ showLogs ? '▶' : '◀' }}
+    </button>
+
     <!-- 日志面板 -->
-    <div class="log-panel">
-      <h3>ADS-B Receiver Log (1090MHz)</h3>
-      <div class="logs" ref="logContainer">
-        <div v-for="(log, index) in logs" :key="index" class="log-entry">{{ log }}</div>
+    <aside v-show="showLogs" class="log-panel">
+      <h3>📝 日志</h3>
+      <div ref="logContainer" class="logs">
+        <div v-for="(log, index) in logs" :key="index" class="log-entry">
+          {{ log }}
+        </div>
       </div>
-    </div>
+    </aside>
   </div>
 </template>
 
@@ -904,48 +1185,586 @@ const canReplay = computed(() => mode.value !== 'recording');
 </style>
 
 <style scoped>
-.container {
+/* ==================== 模态窗口 ==================== */
+.modal-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 2000;
+}
+
+.modal-content {
+  background: #fff;
+  border-radius: 12px;
+  box-shadow: 0 8px 48px rgba(0, 0, 0, 0.25);
+  width: 90%;
+  max-width: 500px;
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 24px 28px;
+  border-bottom: 1px solid #e8eef5;
+  background: #f6f8fa;
+}
+
+.modal-header h2 {
+  margin: 0;
+  font-size: 18px;
+  color: #232f3e;
+}
+
+.modal-close-btn {
+  background: none;
+  border: none;
+  font-size: 24px;
+  color: #888;
+  cursor: pointer;
+  transition: color 0.2s;
+}
+
+.modal-close-btn:hover {
+  color: #232f3e;
+}
+
+.modal-body {
+  padding: 24px 28px;
+  overflow-y: auto;
+  flex: 1;
+}
+
+/* 过渡动画 */
+.modal-enter-active,
+.modal-leave-active {
+  transition: opacity 0.3s ease;
+}
+
+.modal-enter-from,
+.modal-leave-to {
+  opacity: 0;
+}
+
+.modal-enter-active .modal-content,
+.modal-leave-active .modal-content {
+  transition: transform 0.3s ease;
+}
+
+.modal-enter-from .modal-content,
+.modal-leave-to .modal-content {
+  transform: scale(0.95);
+}
+
+/* ==================== 浮窗面板 ==================== */
+.replay-panel {
+  position: fixed;
+  background: #fff;
+  border-radius: 12px;
+  box-shadow: 0 8px 48px rgba(0, 0, 0, 0.25);
+  width: 90%;
+  max-width: 500px;
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  z-index: 1500;
+  user-select: none;
+}
+
+.replay-panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 20px 24px;
+  border-bottom: 1px solid #e8eef5;
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: white;
+  cursor: move;
+  transition: background 0.3s;
+}
+
+.replay-panel-header:hover {
+  background: linear-gradient(135deg, #5568d3 0%, #673a8e 100%);
+}
+
+.replay-panel-header h3 {
+  margin: 0;
+  font-size: 18px;
+  flex: 1;
+}
+
+.replay-panel-header .close-btn {
+  background: none;
+  border: none;
+  font-size: 24px;
+  color: #fff;
+  cursor: pointer;
+  transition: opacity 0.2s;
+  padding: 0;
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.replay-panel-header .close-btn:hover {
+  opacity: 0.8;
+}
+
+.replay-panel-body {
+  padding: 24px 28px;
+  overflow-y: auto;
+  flex: 1;
+}
+
+.replay-panel.dragging {
+  cursor: grabbing !important;
+}
+
+.replay-panel-header.dragging {
+  cursor: grabbing !important;
+}
+
+/* ==================== 整体布局 ==================== */
+.adsb-layout {
   display: flex;
   width: 100vw;
   height: 100vh;
+  background: #f6f8fa;
+  font-family: 'Segoe UI', 'PingFang SC', Arial, sans-serif;
+  position: relative;
+}
+
+/* ==================== 隐藏/显示按钮 ==================== */
+.toggle-sidebar-btn {
+  position: absolute;
+  left: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 24px;
+  height: 48px;
+  background: #409eff;
+  border: none;
+  color: white;
+  font-size: 14px;
+  cursor: pointer;
+  z-index: 999;
+  transition: all 0.3s;
+  border-radius: 0 6px 6px 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+
+.toggle-sidebar-btn:hover {
+  background: #66b1ff;
+  width: 28px;
+}
+
+.toggle-logs-btn {
+  position: absolute;
+  right: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 24px;
+  height: 48px;
+  background: #409eff;
+  border: none;
+  color: white;
+  font-size: 14px;
+  cursor: pointer;
+  z-index: 999;
+  transition: all 0.3s;
+  border-radius: 6px 0 0 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+
+.toggle-logs-btn:hover {
+  background: #66b1ff;
+  width: 28px;
+}
+
+/* ==================== 侧边栏 ==================== */
+.sidebar {
+  width: 320px;
+  background: #1e2139;
+  color: #fff;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid #2a3148;
+  overflow: hidden;
+  transition: margin-left 0.3s ease, opacity 0.3s ease;
+}
+
+.logo-section {
+  padding: 24px 20px;
+  border-bottom: 1px solid #2a3148;
+  text-align: center;
+}
+
+.logo {
+  font-size: 1.8rem;
+  font-weight: bold;
+  letter-spacing: 2px;
+  margin-bottom: 6px;
+}
+
+.version {
+  font-size: 12px;
+  color: #888;
+}
+
+.main-menu {
+  display: flex;
+  flex-direction: column;
+  padding: 12px 0;
+  border-bottom: 1px solid #2a3148;
+}
+
+.menu-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 20px;
+  background: none;
+  border: none;
+  color: #a0aec0;
+  cursor: pointer;
+  transition: all 0.2s;
+  font-size: 14px;
+}
+
+.menu-item:hover {
+  background: rgba(255, 255, 255, 0.05);
+  color: #fff;
+}
+
+.menu-item.active {
+  background: rgba(65, 157, 255, 0.15);
+  color: #409eff;
+  border-left: 4px solid #409eff;
+  padding-left: 16px;
+}
+
+.menu-icon {
+  font-size: 18px;
+}
+
+/* ==================== 菜单内容区 ==================== */
+.menu-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px;
+}
+
+/* ==================== 飞机列表 ==================== */
+.planes-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.search-box {
+  margin-bottom: 16px;
+}
+
+.search-input {
+  width: 100%;
+  padding: 10px 12px;
+  background: #2a3148;
+  border: 1px solid #3a4560;
+  border-radius: 6px;
+  color: #fff;
+  font-size: 13px;
+  transition: all 0.2s;
+}
+
+.search-input::placeholder {
+  color: #666;
+}
+
+.search-input:focus {
+  outline: none;
+  border-color: #409eff;
+  background: #323d54;
+}
+
+.planes-container {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.plane-item {
+  padding: 12px;
+  background: #2a3148;
+  border: 2px solid transparent;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.plane-item:hover {
+  background: #323d54;
+  border-color: #409eff;
+}
+
+.plane-item.selected {
+  background: rgba(65, 157, 255, 0.2);
+  border-color: #409eff;
+}
+
+.plane-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.callsign {
+  font-weight: 600;
+  color: #fff;
+  font-size: 14px;
+}
+
+.status-badge {
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.status-badge.good {
+  background: rgba(76, 175, 80, 0.3);
+  color: #4caf50;
+}
+
+.status-badge.medium {
+  background: rgba(255, 152, 0, 0.3);
+  color: #ff9800;
+}
+
+.status-badge.poor {
+  background: rgba(244, 67, 54, 0.3);
+  color: #f44336;
+}
+
+.plane-brief {
+  font-size: 12px;
+  color: #a0aec0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.empty-state {
+  text-align: center;
+  color: #666;
+  padding: 40px 20px;
+  font-size: 14px;
+}
+
+/* ==================== 主内容区 ==================== */
+.main-content {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  background: #fff;
+  position: relative;
+  overflow: hidden;
+}
+
+.map-section {
+  flex: 1;
+  position: relative;
 }
 
 .map-container {
-  flex: 1;
+  width: 100%;
   height: 100%;
 }
 
-/* ==================== 控制面板 ==================== */
-.control-panel {
-  width: 320px;
-  background: #2d2d2d;
-  color: #e0e0e0;
-  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+/* ==================== 飞机信息卡片 ==================== */
+.plane-info-card {
+  position: absolute;
+  bottom: 20px;
+  right: 20px;
+  width: 360px;
+  background: #fff;
+  border-radius: 12px;
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.15);
+  z-index: 1000;
+  overflow: hidden;
+  animation: slideUp 0.3s ease-out;
+}
+
+@keyframes slideUp {
+  from {
+    transform: translateY(40px);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+.slide-up-enter-active,
+.slide-up-leave-active {
+  transition: all 0.3s ease;
+}
+
+.slide-up-enter-from,
+.slide-up-leave-to {
+  transform: translateY(40px);
+  opacity: 0;
+}
+
+.card-header {
   display: flex;
-  flex-direction: column;
-  border-left: 1px solid #444;
-  padding: 15px;
+  justify-content: space-between;
+  align-items: center;
+  padding: 16px 20px;
+  background: #f6f8fa;
+  border-bottom: 1px solid #e8eef5;
+}
+
+.flight-number {
+  font-size: 16px;
+  font-weight: 600;
+  color: #232f3e;
+}
+
+.close-btn {
+  background: none;
+  border: none;
+  font-size: 24px;
+  color: #888;
+  cursor: pointer;
+  transition: color 0.2s;
+}
+
+.close-btn:hover {
+  color: #232f3e;
+}
+
+.card-body {
+  padding: 16px 20px;
+  max-height: 400px;
   overflow-y: auto;
 }
 
-.control-panel h3 {
-  margin: 0 0 15px 0;
-  font-size: 18px;
-  color: #fff;
-  border-bottom: 2px solid #4CAF50;
-  padding-bottom: 8px;
+.info-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
 }
 
-.control-panel h4 {
-  margin: 15px 0 10px 0;
-  font-size: 14px;
-  color: #aaa;
+.info-item {
+  display: flex;
+  flex-direction: column;
+}
+
+.info-item label {
+  font-size: 12px;
+  color: #888;
+  font-weight: 500;
+  margin-bottom: 4px;
   text-transform: uppercase;
-  letter-spacing: 1px;
+  letter-spacing: 0.5px;
 }
 
+.info-item span {
+  font-size: 13px;
+  color: #232f3e;
+  font-weight: 500;
+  font-family: 'Courier New', monospace;
+}
+
+.nic-value {
+  padding: 2px 6px;
+  border-radius: 4px;
+  display: inline-block;
+  width: fit-content;
+}
+
+.nic-value.good {
+  background: rgba(76, 175, 80, 0.1);
+  color: #4caf50;
+}
+
+.nic-value.medium {
+  background: rgba(255, 152, 0, 0.1);
+  color: #ff9800;
+}
+
+.nic-value.poor {
+  background: rgba(244, 67, 54, 0.1);
+  color: #f44336;
+}
+
+/* ==================== 统计分析视图 ==================== */
+.stats-section {
+  flex: 1;
+  padding: 32px;
+  overflow-y: auto;
+}
+
+.section-header {
+  font-size: 24px;
+  font-weight: 600;
+  color: #232f3e;
+  margin-bottom: 24px;
+  border-bottom: 2px solid #409eff;
+  padding-bottom: 12px;
+}
+
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 20px;
+}
+
+.stat-card {
+  padding: 24px;
+  background: #f6f8fa;
+  border-radius: 12px;
+  text-align: center;
+  border: 1px solid #e8eef5;
+}
+
+.stat-value {
+  font-size: 36px;
+  font-weight: 700;
+  color: #409eff;
+  margin-bottom: 8px;
+}
+
+.stat-label {
+  font-size: 14px;
+  color: #666;
+}
+
+/* ==================== 控制组和状态指示 ==================== */
 .mode-indicator {
-  margin-bottom: 15px;
+  margin-bottom: 16px;
 }
 
 .badge {
@@ -957,7 +1776,7 @@ const canReplay = computed(() => mode.value !== 'recording');
 }
 
 .badge-simulation {
-  background: #4CAF50;
+  background: #4caf50;
   color: white;
 }
 
@@ -968,22 +1787,35 @@ const canReplay = computed(() => mode.value !== 'recording');
 }
 
 .badge-replay {
-  background: #2196F3;
+  background: #2196f3;
   color: white;
 }
 
 @keyframes pulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.6; }
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.6;
+  }
+}
+
+.modal-body h5 {
+  font-size: 13px;
+  font-weight: 600;
+  color: #666;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  margin-top: 0;
+  margin-bottom: 10px;
 }
 
 .control-group {
   margin-bottom: 20px;
   padding-bottom: 20px;
-  border-bottom: 1px solid #444;
+  border-bottom: 1px solid #e8eef5;
 }
 
-/* ==================== 按钮样式 ==================== */
 .btn {
   padding: 10px 16px;
   margin: 5px 5px 5px 0;
@@ -997,7 +1829,7 @@ const canReplay = computed(() => mode.value !== 'recording');
 
 .btn:hover:not(:disabled) {
   transform: translateY(-2px);
-  box-shadow: 0 4px 8px rgba(0,0,0,0.3);
+  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
 }
 
 .btn:disabled {
@@ -1012,37 +1844,38 @@ const canReplay = computed(() => mode.value !== 'recording');
 }
 
 .btn-stop {
-  background: #FF9800;
+  background: #ff9800;
   color: white;
 }
 
 .btn-download {
-  background: #4CAF50;
+  background: #4caf50;
   color: white;
 }
 
 .btn-load {
-  background: #2196F3;
+  background: #2196f3;
   color: white;
   width: 100%;
 }
 
 .btn-play {
-  background: #4CAF50;
+  background: #4caf50;
   color: white;
 }
 
 .btn-pause {
-  background: #FF9800;
+  background: #ff9800;
   color: white;
 }
 
 .btn-back {
-  background: #9E9E9E;
+  background: #9e9e9e;
   color: white;
 }
 
-.recording-controls, .replay-controls {
+.recording-controls,
+.replay-controls {
   display: flex;
   flex-direction: column;
 }
@@ -1059,25 +1892,24 @@ const canReplay = computed(() => mode.value !== 'recording');
   margin: 0;
 }
 
-/* ==================== 速度控制 ==================== */
 .speed-control {
   display: flex;
   align-items: center;
-  margin-top: 15px;
+  margin-top: 12px;
   gap: 8px;
+  flex-wrap: wrap;
 }
 
 .speed-control label {
   font-size: 13px;
-  color: #aaa;
-  margin-right: 5px;
+  color: #666;
 }
 
 .btn-speed {
   padding: 6px 12px;
-  background: #444;
-  color: #e0e0e0;
-  border: 2px solid #555;
+  background: #f6f8fa;
+  color: #666;
+  border: 1px solid #e8eef5;
   border-radius: 4px;
   font-size: 12px;
   cursor: pointer;
@@ -1085,24 +1917,23 @@ const canReplay = computed(() => mode.value !== 'recording');
 }
 
 .btn-speed:hover {
-  background: #555;
+  background: #e8eef5;
 }
 
 .btn-speed.active {
-  background: #2196F3;
-  border-color: #2196F3;
+  background: #409eff;
+  border-color: #409eff;
   color: white;
   font-weight: bold;
 }
 
-/* ==================== 进度控制 ==================== */
 .progress-control {
-  margin-top: 15px;
+  margin-top: 12px;
 }
 
 .time-display {
   font-size: 13px;
-  color: #aaa;
+  color: #666;
   margin-bottom: 8px;
   text-align: center;
   font-family: 'Courier New', monospace;
@@ -1112,39 +1943,25 @@ const canReplay = computed(() => mode.value !== 'recording');
   width: 100%;
   margin-bottom: 10px;
   cursor: pointer;
-}
-
-.progress-bar {
-  width: 100%;
   height: 6px;
-  background: #444;
-  border-radius: 3px;
-  overflow: hidden;
 }
 
-.progress-fill {
-  height: 100%;
-  background: linear-gradient(90deg, #4CAF50, #2196F3);
-  transition: width 0.1s linear;
-}
-
-/* ==================== 轨迹显示开关 ==================== */
 .trajectory-toggle {
   display: flex;
   align-items: center;
   gap: 8px;
   margin-top: 12px;
   font-size: 13px;
-  color: #ccc;
+  color: #666;
   cursor: pointer;
   user-select: none;
 }
 
-.trajectory-toggle input[type="checkbox"] {
+.trajectory-toggle input[type='checkbox'] {
   width: 16px;
   height: 16px;
   cursor: pointer;
-  accent-color: #2196F3;
+  accent-color: #409eff;
 }
 
 .trajectory-toggle span {
@@ -1152,32 +1969,34 @@ const canReplay = computed(() => mode.value !== 'recording');
 }
 
 .trajectory-toggle:hover span {
-  color: #fff;
+  color: #232f3e;
 }
 
 /* ==================== 日志面板 ==================== */
 .log-panel {
-  width: 300px;
+  width: 280px;
   background: #1e1e1e;
   color: #00ff00;
   font-family: 'Courier New', Courier, monospace;
   display: flex;
   flex-direction: column;
   border-left: 1px solid #333;
+  transition: margin-right 0.3s ease, opacity 0.3s ease;
 }
 
 .log-panel h3 {
-  padding: 10px;
+  padding: 12px 16px;
   margin: 0;
-  background: #333;
+  background: #2d2d2d;
   font-size: 14px;
   color: #fff;
+  border-bottom: 1px solid #333;
 }
 
 .logs {
   flex: 1;
   overflow-y: auto;
-  padding: 10px;
+  padding: 12px;
   font-size: 12px;
 }
 
@@ -1188,8 +2007,54 @@ const canReplay = computed(() => mode.value !== 'recording');
   text-overflow: ellipsis;
 }
 
-/* Darken the map to make the glowing heatmap pop */
-.leaflet-tile-pane {
-  filter: brightness(0.6) invert(1) contrast(1.2) hue-rotate(180deg);
+/* ==================== 响应式设计 ==================== */
+@media (max-width: 1200px) {
+  .sidebar {
+    width: 280px;
+  }
+
+  .plane-info-card {
+    width: 300px;
+  }
+}
+
+@media (max-width: 900px) {
+  .adsb-layout {
+    flex-direction: column;
+  }
+
+  .sidebar {
+    width: 100%;
+    max-height: 200px;
+    border-right: none;
+    border-bottom: 1px solid #2a3148;
+  }
+
+  .main-menu {
+    flex-direction: row;
+    overflow-x: auto;
+  }
+
+  .menu-item {
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+
+  .main-content {
+    flex: 1;
+  }
+
+  .log-panel {
+    width: 100%;
+    max-height: 150px;
+    border-left: none;
+    border-top: 1px solid #333;
+  }
+
+  .plane-info-card {
+    width: 95%;
+    right: 10px;
+    left: 10px;
+  }
 }
 </style>
