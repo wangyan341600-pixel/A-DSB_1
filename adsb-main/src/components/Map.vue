@@ -1154,47 +1154,53 @@ const onMouseUp = () => {
               <span>目标详情</span>
               <button class="close-detail" @click="selectedPlaneId = null">×</button>
             </div>
-            <div class="aircraft-visual">
-              <div class="aircraft-icon-large">✈️</div>
-              <div class="aircraft-callsign">{{ selectedPlane.callsign || selectedPlane.id }}</div>
-            </div>
-            <div class="aircraft-params">
-              <div class="param-row">
-                <div class="param">
-                  <span class="param-label">ICAO</span>
-                  <span class="param-value">{{ selectedPlane.id }}</span>
-                </div>
-                <div class="param">
-                  <span class="param-label">航班号</span>
-                  <span class="param-value">{{ selectedPlane.callsign }}</span>
-                </div>
+            <div class="aircraft-detail-scroll">
+              <div class="aircraft-visual">
+                <div class="aircraft-icon-large">✈️</div>
+                <div class="aircraft-callsign">{{ selectedPlane.callsign || selectedPlane.id }}</div>
               </div>
-              <div class="param-row">
-                <div class="param">
-                  <span class="param-label">高度</span>
-                  <span class="param-value">{{ selectedPlane.altitude.toFixed(0) }}<small>m</small></span>
+              <div class="aircraft-params">
+                <div class="param-row">
+                  <div class="param">
+                    <span class="param-label">ICAO</span>
+                    <span class="param-value">{{ selectedPlane.id }}</span>
+                  </div>
+                  <div class="param">
+                    <span class="param-label">航班号</span>
+                    <span class="param-value">{{ selectedPlane.callsign }}</span>
+                  </div>
                 </div>
-                <div class="param">
-                  <span class="param-label">速度</span>
-                  <span class="param-value">{{ selectedPlane.speed.toFixed(0) }}<small>km/h</small></span>
+                <div class="param-row">
+                  <div class="param">
+                    <span class="param-label">高度</span>
+                    <span class="param-value">{{ selectedPlane.altitude.toFixed(0) }}<small>m</small></span>
+                  </div>
+                  <div class="param">
+                    <span class="param-label">速度</span>
+                    <span class="param-value">{{ selectedPlane.speed.toFixed(0) }}<small>km/h</small></span>
+                  </div>
                 </div>
-              </div>
-              <div class="param-row">
-                <div class="param">
-                  <span class="param-label">航向</span>
-                  <span class="param-value">{{ selectedPlane.heading.toFixed(0) }}<small>°</small></span>
+                <div class="param-row">
+                  <div class="param">
+                    <span class="param-label">航向</span>
+                    <span class="param-value">{{ selectedPlane.heading.toFixed(0) }}<small>°</small></span>
+                  </div>
+                  <div class="param">
+                    <span class="param-label">NIC</span>
+                    <span class="param-value" :class="['nic', selectedPlane.nic >= 8 ? 'good' : selectedPlane.nic >= 4 ? 'medium' : 'poor']">
+                      {{ selectedPlane.nic }}/11
+                    </span>
+                  </div>
                 </div>
-                <div class="param">
-                  <span class="param-label">NIC</span>
-                  <span class="param-value" :class="['nic', selectedPlane.nic >= 8 ? 'good' : selectedPlane.nic >= 4 ? 'medium' : 'poor']">
-                    {{ selectedPlane.nic }}/11
-                  </span>
-                </div>
-              </div>
-              <div class="param-row full">
-                <div class="param">
-                  <span class="param-label">经纬度</span>
-                  <span class="param-value small">{{ selectedPlane.lat.toFixed(4) }}°N, {{ selectedPlane.lng.toFixed(4) }}°E</span>
+                <div class="param-row">
+                  <div class="param">
+                    <span class="param-label">纬度</span>
+                    <span class="param-value">{{ Math.abs(selectedPlane.lat).toFixed(5) }}<small>°{{ selectedPlane.lat >= 0 ? 'N' : 'S' }}</small></span>
+                  </div>
+                  <div class="param">
+                    <span class="param-label">经度</span>
+                    <span class="param-value">{{ Math.abs(selectedPlane.lng).toFixed(5) }}<small>°{{ selectedPlane.lng >= 0 ? 'E' : 'W' }}</small></span>
+                  </div>
                 </div>
               </div>
             </div>
@@ -1649,20 +1655,23 @@ const onMouseUp = () => {
 /* 自定义滚动条 */
 .panel-content::-webkit-scrollbar,
 .targets-scroll::-webkit-scrollbar,
-.logs-scroll::-webkit-scrollbar {
+.logs-scroll::-webkit-scrollbar,
+.aircraft-detail-scroll::-webkit-scrollbar {
   width: 6px;
 }
 
 .panel-content::-webkit-scrollbar-track,
 .targets-scroll::-webkit-scrollbar-track,
-.logs-scroll::-webkit-scrollbar-track {
+.logs-scroll::-webkit-scrollbar-track,
+.aircraft-detail-scroll::-webkit-scrollbar-track {
   background: rgba(0, 0, 0, 0.2);
   border-radius: 3px;
 }
 
 .panel-content::-webkit-scrollbar-thumb,
 .targets-scroll::-webkit-scrollbar-thumb,
-.logs-scroll::-webkit-scrollbar-thumb {
+.logs-scroll::-webkit-scrollbar-thumb,
+.aircraft-detail-scroll::-webkit-scrollbar-thumb {
   background: linear-gradient(180deg, #00d4ff 0%, #0080ff 100%);
   border-radius: 3px;
 }
@@ -2026,6 +2035,18 @@ const onMouseUp = () => {
 
 .aircraft-detail .close-detail:hover {
   color: #ff4757;
+}
+
+.aircraft-detail {
+  display: flex;
+  flex-direction: column;
+  max-height: 400px;
+}
+
+.aircraft-detail-scroll {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
 }
 
 .aircraft-visual {
