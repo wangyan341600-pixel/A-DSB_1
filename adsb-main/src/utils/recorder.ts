@@ -197,19 +197,20 @@ export class ReplayEngine {
       this.reset();
     }
 
-    if (this.state === 'paused') {
-      // 从暂停位置继续
-      const pausedDuration = this.pausedAt;
+    if (this.state === 'paused' || (this.state === 'idle' && this.pausedAt > 0)) {
+      // 从暂停/停止位置继续（pausedAt 保存了上次的播放位置）
+      const pausedDuration = this.pausedAt / this.playbackSpeed;
       this.playbackStartTime = Date.now() - pausedDuration;
+      console.log(`[Replay] ▶️ Resuming from ${(this.pausedAt / 1000).toFixed(1)}s`);
     } else {
       // 从头开始
       this.playbackStartTime = Date.now();
+      console.log(`[Replay] ▶️ Starting from beginning`);
     }
 
     this.state = 'playing';
     this.onStateChangeCallback?.('playing');
     this.scheduleNextEvent();
-    console.log(`[Replay] ▶️ Playback started/resumed at speed ${this.playbackSpeed}x`);
   }
 
   /**
@@ -231,19 +232,32 @@ export class ReplayEngine {
   }
 
   /**
-   * 停止播放并重置
+   * 停止播放
+   * @param preserveState 是否保留当前状态（不重置播放位置）
    */
-  stop() {
-    this.state = 'idle';
-    this.reset();
-    
+  stop(preserveState: boolean = false) {
+    // 取消动画帧
     if (this.animationFrameId !== null) {
       cancelAnimationFrame(this.animationFrameId);
       this.animationFrameId = null;
     }
 
-    this.onStateChangeCallback?.('idle');
-    console.log('[Replay] ⏹️ Playback stopped');
+    if (preserveState) {
+      // 保留当前状态，只暂停播放
+      // 记录当前播放位置到 pausedAt（便于后续恢复）
+      if (this.state === 'playing') {
+        this.pausedAt = (Date.now() - this.playbackStartTime) * this.playbackSpeed;
+      }
+      this.state = 'idle';
+      this.onStateChangeCallback?.('idle');
+      console.log('[Replay] ⏹️ Playback stopped (state preserved)');
+    } else {
+      // 完全重置
+      this.state = 'idle';
+      this.reset();
+      this.onStateChangeCallback?.('idle');
+      console.log('[Replay] ⏹️ Playback stopped and reset');
+    }
   }
 
   /**

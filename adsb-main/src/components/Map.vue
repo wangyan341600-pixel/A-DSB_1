@@ -13,6 +13,8 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 
 // 数据源模式：'frontend' 使用前端 JS 模拟，'backend' 使用 Rust 后端
 const dataSource = ref<'frontend' | 'backend'>('frontend');
+// 保存进入回放模式前的数据源，以便返回时恢复
+const previousDataSource = ref<'frontend' | 'backend'>('frontend');
 let tauriUnlisten: UnlistenFn | null = null;
 
 const mapContainer = ref<HTMLElement | null>(null);
@@ -720,15 +722,25 @@ const loadRecordingFile = async (event: Event) => {
   const session = await StorageManager.loadFromFile(file);
   if (session) {
     if (replayEngine.loadSession(session)) {
-      mode.value = 'replay';
+      // 保存当前数据源，以便返回时恢复
+      previousDataSource.value = dataSource.value;
       
-      // 停止模拟
+      // 先停止模拟（必须在切换模式之前）
       if (simulationInterval) {
         clearInterval(simulationInterval);
         simulationInterval = null;
       }
       
-      // 清空当前状态
+      // 停止 Rust 后端模拟（如果正在运行）
+      if (dataSource.value === 'backend') {
+        await stopRustSimulation();
+        dataSource.value = 'frontend';
+      }
+      
+      // 切换到回放模式
+      mode.value = 'replay';
+      
+      // 清空当前所有状态（包括模拟模式的飞机）
       clearCurrentState();
       
       // 设置地图中心
@@ -736,23 +748,15 @@ const loadRecordingFile = async (event: Event) => {
         map.setView(session.mapConfig.center, session.mapConfig.zoom);
       }
       
-      // 恢复初始状态
-      const initEvent = session.events.find(e => e.type === 'init');
-      if (initEvent?.data.truthStates) {
-        initEvent.data.truthStates.forEach(state => {
-          truthAircrafts.value.set(state.id, {
-            ...state,
-            lastSeen: Date.now()
-          });
-        });
-      }
+      // 注意：不恢复 truthAircrafts，回放模式只依赖录制的消息来重建飞机状态
+      // truthAircrafts 只在模拟模式中使用，用于生成模拟信号
       
       logs.value.unshift(`[System] 📂 Loaded recording: ${session.events.length} events, ${(session.duration/1000).toFixed(1)}s`);
       
       // 设置回调
       setupReplayCallbacks();
       
-      // 立即更新一次地图以显示初始状态（如果有）
+      // 初始状态下地图为空，等待用户点击播放
       updateMap();
     }
   }
@@ -808,9 +812,24 @@ const pauseReplay = () => {
 };
 
 const stopReplay = () => {
-  replayEngine.stop();
-  clearCurrentState();
-  logs.value.unshift('[System] ⏹️ Playback stopped');
+  // 停止回放引擎，但保留当前界面状态（传入 true 表示保留状态）
+  replayEngine.stop(true);
+  // 重置播放状态为 idle，但保持在 replay 模式
+  playbackState.value = 'idle';
+  logs.value.unshift('[System] ⏹️ Playback stopped (state preserved)');
+};
+
+/**
+ * 关闭回放面板
+ * 关闭时立即返回模拟模式
+ */
+const closeReplayPanel = async () => {
+  showReplayPanel.value = false;
+  
+  // 如果不在模拟模式，立即返回模拟模式
+  if (mode.value !== 'simulation') {
+    await backToSimulation();
+  }
 };
 
 const _seekReplay = (event: Event) => {
@@ -877,16 +896,32 @@ const changeSpeed = (newSpeed: number) => {
 /**
  * 返回模拟模式
  */
-const backToSimulation = () => {
+const backToSimulation = async () => {
   replayEngine.stop();
   clearCurrentState();
   mode.value = 'simulation';
   
-  // 重启模拟
-  generateMockAircraft();
-  simulationInterval = window.setInterval(processSignal, 1000);
-  
-  logs.value.unshift('[System] 🔄 Back to simulation mode');
+  // 根据之前保存的数据源恢复
+  if (previousDataSource.value === 'backend') {
+    // 恢复 Rust 后端模拟
+    try {
+      await startRustSimulation();
+      logs.value.unshift('[System] 🔄 Back to Rust backend simulation');
+    } catch (e) {
+      // 如果 Rust 后端启动失败，回退到前端模拟
+      console.error('Failed to restart Rust backend:', e);
+      dataSource.value = 'frontend';
+      generateMockAircraft();
+      simulationInterval = window.setInterval(processSignal, 1000);
+      logs.value.unshift('[System] ⚠️ Rust backend failed, using frontend simulation');
+    }
+  } else {
+    // 恢复前端模拟
+    dataSource.value = 'frontend';
+    generateMockAircraft();
+    simulationInterval = window.setInterval(processSignal, 1000);
+    logs.value.unshift('[System] 🔄 Back to frontend simulation');
+  }
 };
 
 /**
@@ -1062,12 +1097,32 @@ const onMouseUp = () => {
         </button>
       </nav>
       <div class="header-right">
+        <!-- 模式指示器（顶部导航栏） -->
+        <div class="header-mode-indicator">
+          <div v-if="mode === 'simulation'" class="mode-badge mode-simulation">
+            <span class="mode-icon">📡</span>
+            <span class="mode-text">模拟模式</span>
+          </div>
+          <div v-else-if="mode === 'recording'" class="mode-badge mode-recording">
+            <span class="mode-icon recording-pulse">🔴</span>
+            <span class="mode-text">正在录制</span>
+            <span class="recording-timer">REC</span>
+          </div>
+          <div v-else-if="mode === 'replay'" class="mode-badge mode-replay">
+            <span class="mode-icon">▶️</span>
+            <span class="mode-text">回放模式</span>
+            <span class="replay-progress">{{ formatTime(playbackCurrentTime) }}</span>
+          </div>
+        </div>
         <div class="datetime">
           <span class="date">{{ currentDate }}</span>
           <span class="time">{{ currentTime }}</span>
         </div>
         <div class="data-source-badge">
-          <span class="badge" :class="dataSource">
+          <span v-if="mode === 'replay'" class="badge replay">
+            💼 录制回放
+          </span>
+          <span v-else class="badge" :class="dataSource">
             {{ dataSource === 'backend' ? '🦀 Rust后端' : '📺 前端模拟' }}
           </span>
         </div>
@@ -1107,7 +1162,9 @@ const onMouseUp = () => {
               </div>
               <div class="info-row">
                 <span class="label">数据源</span>
-                <span class="value highlight">{{ dataSource === 'backend' ? 'Rust后端' : '前端模拟' }}</span>
+                <span class="value highlight">
+                  {{ mode === 'replay' ? '录制回放' : (dataSource === 'backend' ? 'Rust后端' : '前端模拟') }}
+                </span>
               </div>
             </div>
           </div>
@@ -1305,7 +1362,7 @@ const onMouseUp = () => {
     <div v-if="showReplayPanel" class="replay-panel" :style="{ left: replayPanelPosition.x + 'px', top: replayPanelPosition.y + 'px' }">
       <div class="replay-panel-header" @mousedown="onReplayPanelMouseDown">
         <h3>🎬 数据回放控制</h3>
-        <button class="close-btn" @click.stop="showReplayPanel = false">×</button>
+        <button class="close-btn" @click.stop="closeReplayPanel">×</button>
       </div>
       <div class="replay-panel-body">
         <!-- 模式指示 -->
@@ -1564,6 +1621,12 @@ const onMouseUp = () => {
 .data-source-badge .badge.frontend {
   background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
   color: white;
+}
+
+.data-source-badge .badge.replay {
+  background: linear-gradient(135deg, #00d4ff 0%, #00ff88 100%);
+  color: #0a0e17;
+  box-shadow: 0 0 15px rgba(0, 212, 255, 0.4);
 }
 
 /* ==================== 主体区域 ==================== */
@@ -2269,7 +2332,117 @@ const onMouseUp = () => {
   text-overflow: ellipsis;
 }
 
-/* ==================== 控制组和状态指示（深色风格） ==================== */
+/* ==================== 顶部导航栏模式指示器 ==================== */
+.header-mode-indicator {
+  display: flex;
+  align-items: center;
+}
+
+.mode-badge {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  transition: all 0.3s ease;
+}
+
+.mode-icon {
+  font-size: 14px;
+}
+
+.mode-text {
+  letter-spacing: 0.5px;
+}
+
+/* 模拟模式 - 蓝色科技风 */
+.mode-simulation {
+  background: linear-gradient(135deg, rgba(0, 128, 255, 0.2) 0%, rgba(102, 126, 234, 0.15) 100%);
+  border: 1px solid rgba(0, 128, 255, 0.4);
+  color: #66b3ff;
+  box-shadow: 0 0 15px rgba(0, 128, 255, 0.2), inset 0 0 10px rgba(0, 128, 255, 0.05);
+}
+
+.mode-simulation .mode-icon {
+  animation: radar-rotate 3s linear infinite;
+}
+
+@keyframes radar-rotate {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+/* 录制模式 - 红色警示风 */
+.mode-recording {
+  background: linear-gradient(135deg, rgba(255, 71, 87, 0.25) 0%, rgba(255, 107, 107, 0.2) 100%);
+  border: 1px solid rgba(255, 71, 87, 0.5);
+  color: #ff6b6b;
+  box-shadow: 0 0 20px rgba(255, 71, 87, 0.3), inset 0 0 15px rgba(255, 71, 87, 0.1);
+  animation: recording-glow 1.5s ease-in-out infinite;
+}
+
+.recording-pulse {
+  animation: pulse-icon 1s ease-in-out infinite;
+}
+
+@keyframes pulse-icon {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(1.2); opacity: 0.7; }
+}
+
+.recording-timer {
+  background: rgba(255, 71, 87, 0.3);
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  animation: blink-text 1s step-end infinite;
+}
+
+@keyframes blink-text {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
+@keyframes recording-glow {
+  0%, 100% { 
+    box-shadow: 0 0 20px rgba(255, 71, 87, 0.3), inset 0 0 15px rgba(255, 71, 87, 0.1);
+  }
+  50% { 
+    box-shadow: 0 0 30px rgba(255, 71, 87, 0.5), inset 0 0 20px rgba(255, 71, 87, 0.15);
+  }
+}
+
+/* 回放模式 - 绿色播放风 */
+.mode-replay {
+  background: linear-gradient(135deg, rgba(0, 255, 136, 0.2) 0%, rgba(0, 212, 255, 0.15) 100%);
+  border: 1px solid rgba(0, 255, 136, 0.4);
+  color: #00ff88;
+  box-shadow: 0 0 15px rgba(0, 255, 136, 0.2), inset 0 0 10px rgba(0, 255, 136, 0.05);
+}
+
+.mode-replay .mode-icon {
+  animation: play-bounce 0.8s ease-in-out infinite;
+}
+
+@keyframes play-bounce {
+  0%, 100% { transform: translateX(0); }
+  50% { transform: translateX(2px); }
+}
+
+.replay-progress {
+  background: rgba(0, 255, 136, 0.2);
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-family: 'Consolas', 'Courier New', monospace;
+  font-weight: 600;
+}
+
+/* ==================== 回放面板内的模式指示（深色风格） ==================== */
 .mode-indicator {
   margin-bottom: 16px;
 }
