@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref, onUnmounted, computed } from 'vue';
+import { onMounted, ref, onUnmounted, computed, watch, nextTick } from 'vue';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 import 'leaflet.heat';
@@ -26,6 +26,8 @@ const logs = ref<string[]>([]);
 // UI菜单状态
 const activeMenu = ref<'planes' | 'map' | 'stats'>('planes');
 const selectedPlaneId = ref<string | null>(null);
+const lockedPlaneId = ref<string | null>(null);  // 锁定跟踪的飞机ID
+let lockBoxMarker: L.Marker | null = null;  // 锁定框标记
 const searchQuery = ref<string>('');
 const showSidebar = ref<boolean>(true);  // 控制侧边栏显示
 const showLogs = ref<boolean>(true);     // 控制日志面板显示
@@ -156,10 +158,11 @@ const createHeatmapLayer = () => {
         
         // Gaussian-like decay with low alpha for accumulation
         // This creates the "hotspot" effect when points overlap
-        gradient.addColorStop(0, `hsla(${hue}, 100%, 60%, ${0.15 * alphaScale})`);
-        gradient.addColorStop(0.3, `hsla(${hue}, 100%, 50%, ${0.08 * alphaScale})`);
-        gradient.addColorStop(0.6, `hsla(${hue}, 100%, 50%, ${0.02 * alphaScale})`);
-        gradient.addColorStop(1, `hsla(${hue}, 100%, 50%, 0)`);
+        // 降低透明度以避免累积过亮
+        gradient.addColorStop(0, `hsla(${hue}, 80%, 45%, ${0.06 * alphaScale})`);
+        gradient.addColorStop(0.3, `hsla(${hue}, 80%, 40%, ${0.03 * alphaScale})`);
+        gradient.addColorStop(0.6, `hsla(${hue}, 80%, 40%, ${0.008 * alphaScale})`);
+        gradient.addColorStop(1, `hsla(${hue}, 80%, 40%, 0)`);
         
         ctx.fillStyle = gradient;
         ctx.arc(point.x, point.y, radius, 0, Math.PI * 2);
@@ -485,6 +488,23 @@ const updateMap = (replayTargetTime?: number) => {
       markers.value.set(aircraft.id, marker);
     }
   });
+
+  // 处理锁定飞机的跟随逻辑
+  if (lockedPlaneId.value) {
+    const lockedPlane = aircrafts.value.get(lockedPlaneId.value);
+    if (lockedPlane && lockedPlane.lat !== 0 && lockedPlane.lng !== 0) {
+      // 更新锁定框位置
+      updateLockBox(lockedPlane);
+      // 地图跟随锁定飞机移动
+      if (map) {
+        map.setView([lockedPlane.lat, lockedPlane.lng], map.getZoom(), { animate: false });
+      }
+    } else {
+      // 如果锁定的飞机已不存在或无效位置，取消锁定
+      lockedPlaneId.value = null;
+      removeLockBox();
+    }
+  }
 
   // Update Heatmap (GNSS Quality Distribution)
   if (heatmapLayer) {
@@ -932,6 +952,10 @@ const clearCurrentState = () => {
   aircrafts.value.clear();
   truthAircrafts.value.clear();
   
+  // 清空锁定状态
+  lockedPlaneId.value = null;
+  removeLockBox();
+  
   // 清空标记
   markers.value.forEach((marker) => {
     if (aircraftLayer) aircraftLayer.removeLayer(marker as any);
@@ -1002,6 +1026,115 @@ const selectPlane = (id: string) => {
   selectedPlaneId.value = id;
 };
 
+// 选择并聚焦飞机（用于态势显示模式）
+const selectAndFocusPlane = (plane: AircraftState) => {
+  selectedPlaneId.value = plane.id;
+  
+  // 切换锁定状态：如果点击的是已锁定的飞机，则取消锁定；否则锁定新飞机
+  if (lockedPlaneId.value === plane.id) {
+    // 取消锁定
+    lockedPlaneId.value = null;
+    removeLockBox();
+  } else {
+    // 锁定新飞机
+    lockedPlaneId.value = plane.id;
+    // 将地图视图移动到该飞机位置
+    if (map && plane.lat !== 0 && plane.lng !== 0) {
+      map.setView([plane.lat, plane.lng], map.getZoom(), { animate: true });
+      // 移动后刷新地图尺寸，确保完整渲染
+      nextTick(() => {
+        setTimeout(() => {
+          map?.invalidateSize({ animate: false });
+        }, 100);
+      });
+    }
+    // 更新锁定框位置
+    updateLockBox(plane);
+  }
+};
+
+// 创建锁定框图标
+const createLockBoxIcon = () => {
+  return L.divIcon({
+    html: `<div class="lock-box"></div>`,
+    className: 'lock-box-icon',
+    iconSize: [60, 60],
+    iconAnchor: [30, 30],
+  });
+};
+
+// 更新锁定框位置
+const updateLockBox = (plane: AircraftState) => {
+  if (!map || !aircraftLayer) return;
+  
+  if (plane.lat === 0 && plane.lng === 0) {
+    removeLockBox();
+    return;
+  }
+  
+  const newLatLng = new L.LatLng(plane.lat, plane.lng);
+  
+  if (lockBoxMarker) {
+    lockBoxMarker.setLatLng(newLatLng);
+  } else {
+    lockBoxMarker = L.marker(newLatLng, {
+      icon: createLockBoxIcon(),
+      interactive: false,  // 不响应点击事件
+      zIndexOffset: 1000   // 确保在飞机图标上层
+    });
+    lockBoxMarker.addTo(aircraftLayer);
+  }
+};
+
+// 移除锁定框
+const removeLockBox = () => {
+  if (lockBoxMarker && aircraftLayer) {
+    aircraftLayer.removeLayer(lockBoxMarker);
+    lockBoxMarker = null;
+  }
+};
+
+// 切换到态势显示视图
+const switchToMapView = () => {
+  activeMenu.value = 'map';
+  // 态势显示模式下自动隐藏左侧面板
+};
+
+// 切换到目标列表视图
+const switchToPlanesView = () => {
+  activeMenu.value = 'planes';
+  // 目标列表模式下自动显示左侧面板
+  showSidebar.value = true;
+};
+
+// 监听面板状态变化，触发地图重新计算尺寸
+const refreshMapSize = () => {
+  if (map) {
+    // 使用 nextTick 确保 DOM 更新完成后再触发
+    nextTick(() => {
+      // 延迟一小段时间等待 CSS 过渡完成
+      setTimeout(() => {
+        map?.invalidateSize({ animate: false });
+      }, 50);
+    });
+  }
+};
+
+// 监听左侧面板状态
+watch(showSidebar, () => {
+  refreshMapSize();
+});
+
+// 监听右侧日志面板状态
+watch(showLogs, () => {
+  refreshMapSize();
+});
+
+// 监听当前菜单状态（态势显示/目标列表切换）
+watch(activeMenu, () => {
+  refreshMapSize();
+});
+
 // 飞机列表计算属性（支持搜索过滤）
 const planesList = computed(() => {
   const planes: AircraftState[] = [];
@@ -1024,6 +1157,19 @@ const planesList = computed(() => {
 const selectedPlane = computed(() => {
   if (!selectedPlaneId.value) return null;
   return aircrafts.value.get(selectedPlaneId.value) || null;
+});
+
+// 按信号质量(NIC)排序的飞机列表（用于态势显示模式底部列表）
+const planesListByNic = computed(() => {
+  const planes: AircraftState[] = [];
+  aircrafts.value.forEach((aircraft) => {
+    // 只显示有有效位置的飞机（与地图上显示的一致）
+    if (aircraft.lat !== 0 && aircraft.lng !== 0) {
+      planes.push(aircraft);
+    }
+  });
+  // 按 NIC 从高到低排序
+  return planes.sort((a, b) => b.nic - a.nic);
 });
 
 // 浮窗拖动相关函数
@@ -1083,10 +1229,10 @@ const onMouseUp = () => {
         </div>
       </div>
       <nav class="header-nav">
-        <button :class="['nav-btn', { active: activeMenu === 'map' }]" @click="activeMenu = 'map'">
+        <button :class="['nav-btn', { active: activeMenu === 'map' }]" @click="switchToMapView">
           <span>📡</span> 态势显示
         </button>
-        <button :class="['nav-btn', { active: activeMenu === 'planes' }]" @click="activeMenu = 'planes'">
+        <button :class="['nav-btn', { active: activeMenu === 'planes' }]" @click="switchToPlanesView">
           <span>✈️</span> 目标列表
         </button>
         <button :class="['nav-btn', { active: activeMenu === 'stats' }]" @click="activeMenu = 'stats'">
@@ -1130,13 +1276,13 @@ const onMouseUp = () => {
     </header>
 
     <div class="main-body">
-      <!-- 左侧面板 -->
-      <aside class="left-panel" :class="{ collapsed: !showSidebar }">
-        <button class="panel-toggle left" @click="showSidebar = !showSidebar" :title="showSidebar ? '隐藏状态栏' : '显示状态栏'">
+      <!-- 左侧面板：态势显示模式下隐藏，目标列表模式下显示 -->
+      <aside class="left-panel" :class="{ collapsed: !showSidebar || activeMenu === 'map' }">
+        <button v-show="activeMenu !== 'map'" class="panel-toggle left" @click="showSidebar = !showSidebar" :title="showSidebar ? '隐藏状态栏' : '显示状态栏'">
           <span class="toggle-icon">{{ showSidebar ? '«' : '»' }}</span>
         </button>
         
-        <div v-show="showSidebar" class="panel-content">
+        <div v-show="showSidebar && activeMenu !== 'map'" class="panel-content">
           <!-- 雷达状态信息 -->
           <div class="info-block">
             <div class="block-header">
@@ -1305,6 +1451,51 @@ const onMouseUp = () => {
             <span class="value">深圳空域</span>
           </div>
         </div>
+        
+        <!-- 态势显示模式的额外信息覆盖层 -->
+        <div v-if="activeMenu === 'map'" class="map-overlay top-right situation-info">
+          <div class="situation-stats">
+            <div class="situation-stat">
+              <span class="stat-icon">✈️</span>
+              <span class="stat-num">{{ aircrafts.size }}</span>
+              <span class="stat-label">在线目标</span>
+            </div>
+            <div class="situation-stat good">
+              <span class="stat-icon">🟢</span>
+              <span class="stat-num">{{ planesList.filter(p => p.nic >= 8).length }}</span>
+              <span class="stat-label">高精度</span>
+            </div>
+            <div class="situation-stat warning">
+              <span class="stat-icon">🟡</span>
+              <span class="stat-num">{{ planesList.filter(p => p.nic >= 4 && p.nic < 8).length }}</span>
+              <span class="stat-label">中等</span>
+            </div>
+            <div class="situation-stat danger">
+              <span class="stat-icon">🔴</span>
+              <span class="stat-num">{{ planesList.filter(p => p.nic < 4).length }}</span>
+              <span class="stat-label">低质量</span>
+            </div>
+          </div>
+        </div>
+        
+        <!-- 态势显示模式的快速目标列表（底部浮动） -->
+        <div v-if="activeMenu === 'map' && planesListByNic.length > 0" class="map-overlay bottom-center quick-targets">
+          <div class="quick-targets-header">
+            <span class="qt-header-icon">✈️</span>
+            <span class="qt-header-text">目标列表 ({{ planesListByNic.length }}) - 按信号质量排序</span>
+          </div>
+          <div class="quick-targets-scroll">
+            <div v-for="plane in planesListByNic" :key="plane.id" 
+                 class="quick-target-item"
+                 :class="{ selected: selectedPlaneId === plane.id, locked: lockedPlaneId === plane.id }"
+                 @click="selectAndFocusPlane(plane)">
+              <span v-if="lockedPlaneId === plane.id" class="qt-lock-icon">🔒</span>
+              <span v-else class="qt-icon">✈️</span>
+              <span class="qt-name">{{ plane.callsign || plane.id }}</span>
+              <span :class="['qt-nic', plane.nic >= 8 ? 'good' : plane.nic >= 4 ? 'medium' : 'poor']">{{ plane.nic }}</span>
+            </div>
+          </div>
+        </div>
 
         <!-- 统计面板（覆盖在地图上） -->
         <div v-if="activeMenu === 'stats'" class="stats-overlay">
@@ -1336,13 +1527,13 @@ const onMouseUp = () => {
         </div>
       </main>
 
-      <!-- 右侧日志面板 -->
-      <aside class="right-panel" :class="{ collapsed: !showLogs }">
-        <button class="panel-toggle right" @click="showLogs = !showLogs" :title="showLogs ? '隐藏日志' : '显示日志'">
+      <!-- 右侧日志面板：态势显示模式下隐藏 -->
+      <aside class="right-panel" :class="{ collapsed: !showLogs || activeMenu === 'map' }">
+        <button v-show="activeMenu !== 'map'" class="panel-toggle right" @click="showLogs = !showLogs" :title="showLogs ? '隐藏日志' : '显示日志'">
           <span class="toggle-icon">{{ showLogs ? '»' : '«' }}</span>
         </button>
         
-        <div v-show="showLogs" class="panel-content">
+        <div v-show="showLogs && activeMenu !== 'map'" class="panel-content">
           <div class="info-block logs-block">
             <div class="block-header">
               <span class="header-icon">📝</span>
@@ -1450,6 +1641,62 @@ const onMouseUp = () => {
 .plane-icon {
   background: transparent;
   border: none;
+}
+
+/* 锁定框图标容器 */
+.lock-box-icon {
+  background: transparent !important;
+  border: none !important;
+}
+
+/* 锁定框样式 */
+.lock-box {
+  width: 60px;
+  height: 60px;
+  border: 3px solid #ff3b30;
+  border-radius: 8px;
+  box-shadow: 
+    0 0 15px rgba(255, 59, 48, 0.6),
+    0 0 30px rgba(255, 59, 48, 0.3),
+    inset 0 0 15px rgba(255, 59, 48, 0.2);
+  animation: lock-box-pulse 1.2s ease-in-out infinite;
+  position: relative;
+}
+
+/* 锁定框四角装饰 */
+.lock-box::before,
+.lock-box::after {
+  content: '';
+  position: absolute;
+  width: 12px;
+  height: 12px;
+  border-color: #ff3b30;
+  border-style: solid;
+}
+
+.lock-box::before {
+  top: -2px;
+  left: -2px;
+  border-width: 3px 0 0 3px;
+  border-radius: 4px 0 0 0;
+}
+
+.lock-box::after {
+  bottom: -2px;
+  right: -2px;
+  border-width: 0 3px 3px 0;
+  border-radius: 0 0 4px 0;
+}
+
+@keyframes lock-box-pulse {
+  0%, 100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+  50% {
+    transform: scale(1.05);
+    opacity: 0.85;
+  }
 }
 </style>
 
@@ -2225,6 +2472,193 @@ const onMouseUp = () => {
   font-size: 13px;
   color: #00d4ff;
   font-weight: 600;
+}
+
+/* ==================== 态势显示模式覆盖层 ==================== */
+.situation-info {
+  padding: 12px 16px;
+  min-width: auto;
+}
+
+.situation-stats {
+  display: flex;
+  gap: 16px;
+}
+
+.situation-stat {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 8px 12px;
+  background: rgba(0, 0, 0, 0.3);
+  border-radius: 8px;
+  min-width: 60px;
+}
+
+.situation-stat .stat-icon {
+  font-size: 16px;
+}
+
+.situation-stat .stat-num {
+  font-size: 20px;
+  font-weight: 700;
+  color: #00d4ff;
+  font-family: 'Consolas', monospace;
+}
+
+.situation-stat .stat-label {
+  font-size: 10px;
+  color: #5a6270;
+  white-space: nowrap;
+}
+
+.situation-stat.good .stat-num {
+  color: #00ff88;
+}
+
+.situation-stat.warning .stat-num {
+  color: #ffaa33;
+}
+
+.situation-stat.danger .stat-num {
+  color: #ff4757;
+}
+
+/* 快速目标列表（底部） */
+.map-overlay.bottom-center {
+  bottom: 20px;
+  left: 50%;
+  transform: translateX(-50%);
+  top: auto;
+  max-width: 90%;
+  padding: 0;
+}
+
+.quick-targets {
+  background: rgba(10, 14, 23, 0.95);
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.quick-targets-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px;
+  background: linear-gradient(90deg, rgba(0, 212, 255, 0.15) 0%, rgba(0, 128, 255, 0.1) 100%);
+  border-bottom: 1px solid rgba(0, 212, 255, 0.2);
+}
+
+.qt-header-icon {
+  font-size: 14px;
+}
+
+.qt-header-text {
+  font-size: 12px;
+  font-weight: 600;
+  color: #00d4ff;
+  letter-spacing: 0.5px;
+}
+
+.quick-targets-scroll {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  padding: 12px 16px;
+  scroll-behavior: smooth;
+}
+
+.quick-targets-scroll::-webkit-scrollbar {
+  height: 6px;
+}
+
+.quick-targets-scroll::-webkit-scrollbar-track {
+  background: rgba(0, 0, 0, 0.3);
+  border-radius: 3px;
+}
+
+.quick-targets-scroll::-webkit-scrollbar-thumb {
+  background: linear-gradient(90deg, #00d4ff, #0080ff);
+  border-radius: 3px;
+}
+
+.quick-targets-scroll::-webkit-scrollbar-thumb:hover {
+  background: linear-gradient(90deg, #33ddff, #3399ff);
+}
+
+.quick-target-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px;
+  background: rgba(0, 0, 0, 0.4);
+  border: 1px solid transparent;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.quick-target-item:hover {
+  background: rgba(0, 212, 255, 0.15);
+  border-color: rgba(0, 212, 255, 0.3);
+}
+
+.quick-target-item.selected {
+  background: rgba(0, 212, 255, 0.2);
+  border-color: #00d4ff;
+  box-shadow: 0 0 10px rgba(0, 212, 255, 0.3);
+}
+
+.quick-target-item.locked {
+  background: rgba(255, 59, 48, 0.25);
+  border-color: #ff3b30;
+  box-shadow: 0 0 12px rgba(255, 59, 48, 0.4);
+  animation: locked-pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes locked-pulse {
+  0%, 100% { box-shadow: 0 0 12px rgba(255, 59, 48, 0.4); }
+  50% { box-shadow: 0 0 20px rgba(255, 59, 48, 0.6); }
+}
+
+.qt-lock-icon {
+  font-size: 12px;
+}
+
+.qt-icon {
+  font-size: 14px;
+}
+
+.qt-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: #e0e6ed;
+  max-width: 80px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.qt-nic {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.3);
+}
+
+.qt-nic.good {
+  color: #00ff88;
+}
+
+.qt-nic.medium {
+  color: #ffaa33;
+}
+
+.qt-nic.poor {
+  color: #ff4757;
 }
 
 /* ==================== 统计面板覆盖层 ==================== */
