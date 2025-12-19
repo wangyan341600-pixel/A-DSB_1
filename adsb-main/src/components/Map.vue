@@ -301,6 +301,9 @@ const handleReceivedMessage = (hex: string, eventTimestamp?: number) => {
       state.altitude = pos.altitude;
       state.nic = pos.nic;
       
+      // 更新消息统计
+      updateMessageStats('position');
+      
       // 回放模式：收集轨迹点
       if (mode.value === 'replay' && eventTimestamp !== undefined) {
         addTrajectoryPoint(icao, {
@@ -317,6 +320,9 @@ const handleReceivedMessage = (hex: string, eventTimestamp?: number) => {
       const vel = data as DecodedVelocity;
       state.speed = vel.speed;
       state.heading = vel.heading;
+      
+      // 更新消息统计
+      updateMessageStats('velocity');
     }
   }
 };
@@ -1172,6 +1178,182 @@ const planesListByNic = computed(() => {
   return planes.sort((a, b) => b.nic - a.nic);
 });
 
+// ==================== 高级统计分析 ====================
+// 统计分析面板当前Tab
+const statsActiveTab = ref<'overview' | 'flight' | 'signal' | 'airline'>('overview');
+
+// 消息统计追踪
+const messageStats = ref({
+  totalMessages: 0,
+  positionMessages: 0,
+  velocityMessages: 0,
+  lastMinuteMessages: 0,
+  messagesPerSecond: 0
+});
+const recentMessageTimestamps: number[] = [];
+
+// 更新消息统计（在handleReceivedMessage中调用）
+const updateMessageStats = (msgType: 'position' | 'velocity' | 'other') => {
+  messageStats.value.totalMessages++;
+  if (msgType === 'position') messageStats.value.positionMessages++;
+  else if (msgType === 'velocity') messageStats.value.velocityMessages++;
+  
+  const now = Date.now();
+  recentMessageTimestamps.push(now);
+  // 只保留最近60秒的消息时间戳
+  while (recentMessageTimestamps.length > 0 && recentMessageTimestamps[0] < now - 60000) {
+    recentMessageTimestamps.shift();
+  }
+  messageStats.value.lastMinuteMessages = recentMessageTimestamps.length;
+  messageStats.value.messagesPerSecond = recentMessageTimestamps.filter(t => t > now - 1000).length;
+};
+
+// 飞行统计数据
+const flightStats = computed(() => {
+  const validPlanes = planesListByNic.value;
+  if (validPlanes.length === 0) {
+    return { avgAltitude: 0, avgSpeed: 0, maxAltitude: 0, minAltitude: 0, maxSpeed: 0, minSpeed: 0 };
+  }
+  
+  const altitudes = validPlanes.map(p => p.altitude);
+  const speeds = validPlanes.map(p => p.speed);
+  
+  return {
+    avgAltitude: Math.round(altitudes.reduce((a, b) => a + b, 0) / altitudes.length),
+    avgSpeed: Math.round(speeds.reduce((a, b) => a + b, 0) / speeds.length),
+    maxAltitude: Math.round(Math.max(...altitudes)),
+    minAltitude: Math.round(Math.min(...altitudes)),
+    maxSpeed: Math.round(Math.max(...speeds)),
+    minSpeed: Math.round(Math.min(...speeds))
+  };
+});
+
+// 高度分布统计
+const altitudeDistribution = computed(() => {
+  const validPlanes = planesListByNic.value;
+  const distribution = [
+    { label: '< 3000m', count: 0, color: '#00d4ff' },
+    { label: '3000-6000m', count: 0, color: '#00ff88' },
+    { label: '6000-9000m', count: 0, color: '#ffaa33' },
+    { label: '9000-12000m', count: 0, color: '#ff6b6b' },
+    { label: '> 12000m', count: 0, color: '#9b59b6' }
+  ];
+  
+  validPlanes.forEach(p => {
+    if (p.altitude < 3000) distribution[0].count++;
+    else if (p.altitude < 6000) distribution[1].count++;
+    else if (p.altitude < 9000) distribution[2].count++;
+    else if (p.altitude < 12000) distribution[3].count++;
+    else distribution[4].count++;
+  });
+  
+  return distribution;
+});
+
+// 速度分布统计
+const speedDistribution = computed(() => {
+  const validPlanes = planesListByNic.value;
+  const distribution = [
+    { label: '< 300km/h', count: 0, color: '#00d4ff' },
+    { label: '300-500km/h', count: 0, color: '#00ff88' },
+    { label: '500-700km/h', count: 0, color: '#ffaa33' },
+    { label: '700-900km/h', count: 0, color: '#ff6b6b' },
+    { label: '> 900km/h', count: 0, color: '#9b59b6' }
+  ];
+  
+  validPlanes.forEach(p => {
+    if (p.speed < 300) distribution[0].count++;
+    else if (p.speed < 500) distribution[1].count++;
+    else if (p.speed < 700) distribution[2].count++;
+    else if (p.speed < 900) distribution[3].count++;
+    else distribution[4].count++;
+  });
+  
+  return distribution;
+});
+
+// NIC信号质量分布
+const nicDistribution = computed(() => {
+  const validPlanes = planesListByNic.value;
+  return [
+    { label: '优秀(8-11)', count: validPlanes.filter(p => p.nic >= 8).length, color: '#00ff88', nicRange: 'high' },
+    { label: '良好(4-7)', count: validPlanes.filter(p => p.nic >= 4 && p.nic < 8).length, color: '#ffaa33', nicRange: 'medium' },
+    { label: '较差(0-3)', count: validPlanes.filter(p => p.nic < 4).length, color: '#ff4757', nicRange: 'low' }
+  ];
+});
+
+// NIC饼图样式（动态生成conic-gradient）
+const nicPieChartStyle = computed(() => {
+  const total = aircrafts.value.size;
+  if (total === 0) {
+    return { background: 'rgba(30, 58, 95, 0.5)' };
+  }
+  
+  const dist = nicDistribution.value;
+  const goodPercent = dist[0].count / total * 100;
+  const mediumPercent = dist[1].count / total * 100;
+  // 较差的百分比自动填充剩余
+  
+  const goodEnd = goodPercent;
+  const mediumEnd = goodPercent + mediumPercent;
+  
+  return {
+    background: `conic-gradient(
+      from 0deg,
+      #00ff88 0% ${goodEnd}%,
+      #ffaa33 ${goodEnd}% ${mediumEnd}%,
+      #ff4757 ${mediumEnd}% 100%
+    )`
+  };
+});
+
+// 航空公司统计
+const airlineStats = computed(() => {
+  const validPlanes = planesListByNic.value;
+  const airlines: Record<string, { name: string; count: number; avgNic: number; planes: AircraftState[] }> = {};
+  
+  // 航空公司代码映射
+  const airlineNames: Record<string, string> = {
+    'CZ': '中国南方航空',
+    'CA': '中国国际航空',
+    'MU': '中国东方航空',
+    'BZ': '海南航空',
+    'FM': '上海航空',
+    'ZH': '深圳航空',
+    '3U': '四川航空',
+    'HU': '海南航空',
+    'SC': '山东航空',
+    'MF': '厦门航空'
+  };
+  
+  validPlanes.forEach(p => {
+    const prefix = p.callsign?.substring(0, 2) || 'Unknown';
+    const airlineName = airlineNames[prefix] || `其他(${prefix})`;
+    
+    if (!airlines[prefix]) {
+      airlines[prefix] = { name: airlineName, count: 0, avgNic: 0, planes: [] };
+    }
+    airlines[prefix].count++;
+    airlines[prefix].planes.push(p);
+  });
+  
+  // 计算平均NIC
+  Object.values(airlines).forEach(airline => {
+    airline.avgNic = Math.round(airline.planes.reduce((sum, p) => sum + p.nic, 0) / airline.planes.length * 10) / 10;
+  });
+  
+  // 按数量排序并返回数组
+  return Object.entries(airlines)
+    .sort((a, b) => b[1].count - a[1].count)
+    .map(([code, data]) => ({ code, ...data }));
+});
+
+// 获取分布图最大值（用于计算百分比高度）
+const getMaxDistribution = (dist: Array<{count: number}>) => {
+  const max = Math.max(...dist.map(d => d.count));
+  return max || 1;
+};
+
 // 浮窗拖动相关函数
 const onReplayPanelMouseDown = (event: MouseEvent) => {
   // 点击浮窗任意位置都可以拖动
@@ -1499,28 +1681,263 @@ const onMouseUp = () => {
 
         <!-- 统计面板（覆盖在地图上） -->
         <div v-if="activeMenu === 'stats'" class="stats-overlay">
-          <div class="stats-panel">
-            <h3>📊 实时统计分析</h3>
-            <div class="stats-grid">
-              <div class="stat-item">
-                <div class="stat-icon">✈️</div>
-                <div class="stat-value">{{ aircrafts.size }}</div>
-                <div class="stat-label">在线目标</div>
+          <div class="stats-panel-enhanced">
+            <div class="stats-header">
+              <h3>📊 高级统计分析</h3>
+              <div class="stats-tabs">
+                <button :class="['stats-tab', { active: statsActiveTab === 'overview' }]" @click="statsActiveTab = 'overview'">
+                  📈 概览
+                </button>
+                <button :class="['stats-tab', { active: statsActiveTab === 'flight' }]" @click="statsActiveTab = 'flight'">
+                  ✈️ 飞行数据
+                </button>
+                <button :class="['stats-tab', { active: statsActiveTab === 'signal' }]" @click="statsActiveTab = 'signal'">
+                  📶 信号分析
+                </button>
+                <button :class="['stats-tab', { active: statsActiveTab === 'airline' }]" @click="statsActiveTab = 'airline'">
+                  🏢 航空公司
+                </button>
               </div>
-              <div class="stat-item">
-                <div class="stat-icon">📶</div>
-                <div class="stat-value">{{ planesList.filter(p => p.nic >= 8).length }}</div>
-                <div class="stat-label">高精度信号</div>
+            </div>
+            
+            <!-- 概览 Tab -->
+            <div v-if="statsActiveTab === 'overview'" class="stats-content">
+              <div class="stats-grid-4">
+                <div class="stat-card primary">
+                  <div class="stat-card-icon">✈️</div>
+                  <div class="stat-card-value">{{ aircrafts.size }}</div>
+                  <div class="stat-card-label">在线目标</div>
+                </div>
+                <div class="stat-card success">
+                  <div class="stat-card-icon">📶</div>
+                  <div class="stat-card-value">{{ nicDistribution[0].count }}</div>
+                  <div class="stat-card-label">高精度信号</div>
+                </div>
+                <div class="stat-card warning">
+                  <div class="stat-card-icon">📡</div>
+                  <div class="stat-card-value">{{ nicDistribution[1].count }}</div>
+                  <div class="stat-card-label">中等信号</div>
+                </div>
+                <div class="stat-card danger">
+                  <div class="stat-card-icon">⚠️</div>
+                  <div class="stat-card-value">{{ nicDistribution[2].count }}</div>
+                  <div class="stat-card-label">低质量信号</div>
+                </div>
               </div>
-              <div class="stat-item">
-                <div class="stat-icon">⚠️</div>
-                <div class="stat-value">{{ planesList.filter(p => p.nic < 4).length }}</div>
-                <div class="stat-label">低质量信号</div>
+              
+              <div class="stats-row">
+                <div class="stats-box">
+                  <div class="stats-box-header">📬 消息统计</div>
+                  <div class="msg-stats">
+                    <div class="msg-stat-item">
+                      <span class="msg-label">总消息数</span>
+                      <span class="msg-value">{{ messageStats.totalMessages }}</span>
+                    </div>
+                    <div class="msg-stat-item">
+                      <span class="msg-label">位置消息</span>
+                      <span class="msg-value highlight-blue">{{ messageStats.positionMessages }}</span>
+                    </div>
+                    <div class="msg-stat-item">
+                      <span class="msg-label">速度消息</span>
+                      <span class="msg-value highlight-green">{{ messageStats.velocityMessages }}</span>
+                    </div>
+                    <div class="msg-stat-item">
+                      <span class="msg-label">最近1分钟</span>
+                      <span class="msg-value">{{ messageStats.lastMinuteMessages }}</span>
+                    </div>
+                    <div class="msg-stat-item">
+                      <span class="msg-label">消息频率</span>
+                      <span class="msg-value highlight-cyan">{{ messageStats.messagesPerSecond }} /s</span>
+                    </div>
+                  </div>
+                </div>
+                
+                <div class="stats-box">
+                  <div class="stats-box-header">📊 NIC质量分布</div>
+                  <div class="pie-chart-container">
+                    <div class="pie-chart" :style="nicPieChartStyle">
+                      <div class="pie-center">
+                        <span class="pie-total">{{ aircrafts.size }}</span>
+                        <span class="pie-label">架</span>
+                      </div>
+                    </div>
+                    <div class="pie-legend">
+                      <div class="legend-item" v-for="item in nicDistribution" :key="item.label">
+                        <span class="legend-color" :style="{ background: item.color }"></span>
+                        <span class="legend-text">{{ item.label }}</span>
+                        <span class="legend-value">{{ item.count }}</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
               </div>
-              <div class="stat-item">
-                <div class="stat-icon">📝</div>
-                <div class="stat-value">{{ logs.length }}</div>
-                <div class="stat-label">消息记录</div>
+            </div>
+            
+            <!-- 飞行数据 Tab -->
+            <div v-if="statsActiveTab === 'flight'" class="stats-content">
+              <div class="stats-grid-3">
+                <div class="stat-card-mini">
+                  <span class="mini-icon">📏</span>
+                  <span class="mini-label">平均高度</span>
+                  <span class="mini-value">{{ flightStats.avgAltitude }}m</span>
+                </div>
+                <div class="stat-card-mini">
+                  <span class="mini-icon">⬆️</span>
+                  <span class="mini-label">最大高度</span>
+                  <span class="mini-value">{{ flightStats.maxAltitude }}m</span>
+                </div>
+                <div class="stat-card-mini">
+                  <span class="mini-icon">⬇️</span>
+                  <span class="mini-label">最小高度</span>
+                  <span class="mini-value">{{ flightStats.minAltitude }}m</span>
+                </div>
+                <div class="stat-card-mini">
+                  <span class="mini-icon">🚀</span>
+                  <span class="mini-label">平均速度</span>
+                  <span class="mini-value">{{ flightStats.avgSpeed }}km/h</span>
+                </div>
+                <div class="stat-card-mini">
+                  <span class="mini-icon">⚡</span>
+                  <span class="mini-label">最大速度</span>
+                  <span class="mini-value">{{ flightStats.maxSpeed }}km/h</span>
+                </div>
+                <div class="stat-card-mini">
+                  <span class="mini-icon">🐢</span>
+                  <span class="mini-label">最小速度</span>
+                  <span class="mini-value">{{ flightStats.minSpeed }}km/h</span>
+                </div>
+              </div>
+              
+              <div class="stats-row">
+                <div class="stats-box">
+                  <div class="stats-box-header">📊 高度分布</div>
+                  <div class="bar-chart">
+                    <div class="bar-item" v-for="item in altitudeDistribution" :key="item.label">
+                      <div class="bar-label">{{ item.label }}</div>
+                      <div class="bar-track">
+                        <div class="bar-fill" :style="{ 
+                          width: (item.count / getMaxDistribution(altitudeDistribution) * 100) + '%',
+                          background: item.color
+                        }"></div>
+                      </div>
+                      <div class="bar-value">{{ item.count }}</div>
+                    </div>
+                  </div>
+                </div>
+                
+                <div class="stats-box">
+                  <div class="stats-box-header">🚀 速度分布</div>
+                  <div class="bar-chart">
+                    <div class="bar-item" v-for="item in speedDistribution" :key="item.label">
+                      <div class="bar-label">{{ item.label }}</div>
+                      <div class="bar-track">
+                        <div class="bar-fill" :style="{ 
+                          width: (item.count / getMaxDistribution(speedDistribution) * 100) + '%',
+                          background: item.color
+                        }"></div>
+                      </div>
+                      <div class="bar-value">{{ item.count }}</div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+            
+            <!-- 信号分析 Tab -->
+            <div v-if="statsActiveTab === 'signal'" class="stats-content">
+              <div class="signal-overview">
+                <div class="signal-gauge">
+                  <div class="gauge-ring">
+                    <svg viewBox="0 0 100 100">
+                      <circle class="gauge-bg" cx="50" cy="50" r="40" />
+                      <circle class="gauge-fill" cx="50" cy="50" r="40" 
+                              :stroke-dasharray="aircrafts.size > 0 ? (nicDistribution[0].count / aircrafts.size * 251.2) + ' 251.2' : '0 251.2'"
+                              :style="{ stroke: '#00ff88' }" />
+                    </svg>
+                    <div class="gauge-text">
+                      <span class="gauge-percent">{{ aircrafts.size > 0 ? Math.round(nicDistribution[0].count / aircrafts.size * 100) : 0 }}%</span>
+                      <span class="gauge-label">优良率</span>
+                    </div>
+                  </div>
+                </div>
+                
+                <div class="signal-breakdown">
+                  <div class="signal-item" v-for="item in nicDistribution" :key="item.label">
+                    <div class="signal-header">
+                      <span class="signal-dot" :style="{ background: item.color }"></span>
+                      <span class="signal-name">{{ item.label }}</span>
+                    </div>
+                    <div class="signal-bar-container">
+                      <div class="signal-bar" :style="{ 
+                        width: aircrafts.size > 0 ? (item.count / aircrafts.size * 100) + '%' : '0%',
+                        background: item.color 
+                      }"></div>
+                    </div>
+                    <div class="signal-stats">
+                      <span class="signal-count">{{ item.count }} 架</span>
+                      <span class="signal-percent">{{ aircrafts.size > 0 ? Math.round(item.count / aircrafts.size * 100) : 0 }}%</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              
+              <div class="signal-detail-list">
+                <div class="stats-box-header">🔍 信号详情 (按NIC排序)</div>
+                <div class="signal-table">
+                  <div class="signal-table-header">
+                    <span>航班号</span>
+                    <span>NIC值</span>
+                    <span>质量</span>
+                    <span>高度</span>
+                    <span>速度</span>
+                  </div>
+                  <div class="signal-table-body">
+                    <div class="signal-table-row" v-for="plane in planesListByNic.slice(0, 10)" :key="plane.id">
+                      <span class="flight-name">{{ plane.callsign || plane.id }}</span>
+                      <span class="nic-value">{{ plane.nic }}</span>
+                      <span :class="['quality-badge', plane.nic >= 8 ? 'good' : plane.nic >= 4 ? 'medium' : 'poor']">
+                        {{ plane.nic >= 8 ? '优秀' : plane.nic >= 4 ? '良好' : '较差' }}
+                      </span>
+                      <span>{{ plane.altitude.toFixed(0) }}m</span>
+                      <span>{{ plane.speed.toFixed(0) }}km/h</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+            
+            <!-- 航空公司 Tab -->
+            <div v-if="statsActiveTab === 'airline'" class="stats-content">
+              <div class="airline-summary">
+                <div class="summary-stat">
+                  <span class="summary-value">{{ airlineStats.length }}</span>
+                  <span class="summary-label">航空公司</span>
+                </div>
+                <div class="summary-stat">
+                  <span class="summary-value">{{ aircrafts.size }}</span>
+                  <span class="summary-label">总航班数</span>
+                </div>
+              </div>
+              
+              <div class="airline-list">
+                <div class="airline-item" v-for="airline in airlineStats" :key="airline.code">
+                  <div class="airline-info">
+                    <div class="airline-logo">{{ airline.code }}</div>
+                    <div class="airline-detail">
+                      <span class="airline-name">{{ airline.name }}</span>
+                      <span class="airline-meta">平均NIC: {{ airline.avgNic }}</span>
+                    </div>
+                  </div>
+                  <div class="airline-stats">
+                    <div class="airline-count">{{ airline.count }}</div>
+                    <div class="airline-bar-container">
+                      <div class="airline-bar" :style="{ 
+                        width: (airline.count / (airlineStats[0]?.count || 1) * 100) + '%'
+                      }"></div>
+                    </div>
+                  </div>
+                </div>
+                <div v-if="airlineStats.length === 0" class="empty-airline">暂无航班数据</div>
               </div>
             </div>
           </div>
@@ -3059,6 +3476,7 @@ const onMouseUp = () => {
   width: 100%;
   height: 6px;
   cursor: pointer;
+  appearance: none;
   -webkit-appearance: none;
   background: #1e3a5f;
   border-radius: 3px;
@@ -3066,6 +3484,7 @@ const onMouseUp = () => {
 }
 
 .progress-slider::-webkit-slider-thumb {
+  appearance: none;
   -webkit-appearance: none;
   width: 16px;
   height: 16px;
@@ -3152,14 +3571,669 @@ const onMouseUp = () => {
     display: none;
   }
   
-  .stats-panel {
+  .stats-panel-enhanced {
     min-width: auto;
-    width: 90%;
-    max-width: 400px;
+    width: 95%;
+    max-width: 800px;
   }
   
-  .stats-grid {
+  .stats-grid-4 {
     grid-template-columns: repeat(2, 1fr);
   }
+  
+  .stats-row {
+    flex-direction: column;
+  }
+}
+
+/* ==================== 增强版统计面板样式 ==================== */
+.stats-panel-enhanced {
+  background: rgba(10, 14, 23, 0.98);
+  border: 1px solid #1e3a5f;
+  border-radius: 16px;
+  padding: 0;
+  min-width: 800px;
+  max-width: 900px;
+  max-height: 85vh;
+  overflow: hidden;
+  box-shadow: 0 12px 48px rgba(0, 0, 0, 0.6), 0 0 60px rgba(0, 212, 255, 0.15);
+}
+
+.stats-header {
+  padding: 20px 24px;
+  background: linear-gradient(135deg, rgba(0, 212, 255, 0.1) 0%, rgba(0, 128, 255, 0.05) 100%);
+  border-bottom: 1px solid rgba(30, 58, 95, 0.5);
+}
+
+.stats-header h3 {
+  margin: 0 0 16px 0;
+  color: #00d4ff;
+  font-size: 20px;
+  font-weight: 600;
+  text-align: center;
+  text-shadow: 0 0 20px rgba(0, 212, 255, 0.3);
+}
+
+.stats-tabs {
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+}
+
+.stats-tab {
+  padding: 10px 20px;
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid rgba(30, 58, 95, 0.5);
+  border-radius: 8px;
+  color: #8b9cb5;
+  font-size: 13px;
+  cursor: pointer;
+  transition: all 0.3s ease;
+}
+
+.stats-tab:hover {
+  background: rgba(0, 212, 255, 0.1);
+  border-color: rgba(0, 212, 255, 0.3);
+  color: #e0e6ed;
+}
+
+.stats-tab.active {
+  background: linear-gradient(135deg, rgba(0, 212, 255, 0.2) 0%, rgba(0, 128, 255, 0.15) 100%);
+  border-color: #00d4ff;
+  color: #00d4ff;
+  box-shadow: 0 0 15px rgba(0, 212, 255, 0.2);
+}
+
+.stats-content {
+  padding: 24px;
+  max-height: calc(85vh - 120px);
+  overflow-y: auto;
+}
+
+.stats-content::-webkit-scrollbar {
+  width: 6px;
+}
+
+.stats-content::-webkit-scrollbar-track {
+  background: rgba(0, 0, 0, 0.2);
+}
+
+.stats-content::-webkit-scrollbar-thumb {
+  background: linear-gradient(180deg, #00d4ff, #0080ff);
+  border-radius: 3px;
+}
+
+/* 统计卡片网格 */
+.stats-grid-4 {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 16px;
+  margin-bottom: 24px;
+}
+
+.stats-grid-3 {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 16px;
+  margin-bottom: 24px;
+}
+
+.stat-card {
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid rgba(30, 58, 95, 0.5);
+  border-radius: 12px;
+  padding: 20px;
+  text-align: center;
+  transition: all 0.3s ease;
+}
+
+.stat-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+}
+
+.stat-card.primary { border-color: rgba(0, 212, 255, 0.4); }
+.stat-card.success { border-color: rgba(0, 255, 136, 0.4); }
+.stat-card.warning { border-color: rgba(255, 170, 51, 0.4); }
+.stat-card.danger { border-color: rgba(255, 71, 87, 0.4); }
+
+.stat-card-icon {
+  font-size: 28px;
+  margin-bottom: 8px;
+}
+
+.stat-card-value {
+  font-size: 32px;
+  font-weight: 700;
+  font-family: 'Consolas', monospace;
+  margin-bottom: 6px;
+}
+
+.stat-card.primary .stat-card-value { color: #00d4ff; text-shadow: 0 0 15px rgba(0, 212, 255, 0.5); }
+.stat-card.success .stat-card-value { color: #00ff88; text-shadow: 0 0 15px rgba(0, 255, 136, 0.5); }
+.stat-card.warning .stat-card-value { color: #ffaa33; text-shadow: 0 0 15px rgba(255, 170, 51, 0.5); }
+.stat-card.danger .stat-card-value { color: #ff4757; text-shadow: 0 0 15px rgba(255, 71, 87, 0.5); }
+
+.stat-card-label {
+  font-size: 12px;
+  color: #8b9cb5;
+}
+
+/* 迷你统计卡片 */
+.stat-card-mini {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 16px;
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid rgba(30, 58, 95, 0.4);
+  border-radius: 10px;
+  transition: all 0.3s ease;
+}
+
+.stat-card-mini:hover {
+  border-color: rgba(0, 212, 255, 0.4);
+  background: rgba(0, 212, 255, 0.05);
+}
+
+.mini-icon {
+  font-size: 20px;
+  margin-bottom: 8px;
+}
+
+.mini-label {
+  font-size: 11px;
+  color: #8b9cb5;
+  margin-bottom: 6px;
+}
+
+.mini-value {
+  font-size: 18px;
+  font-weight: 700;
+  color: #00d4ff;
+  font-family: 'Consolas', monospace;
+}
+
+/* 统计行布局 */
+.stats-row {
+  display: flex;
+  gap: 20px;
+}
+
+.stats-box {
+  flex: 1;
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid rgba(30, 58, 95, 0.4);
+  border-radius: 12px;
+  padding: 16px;
+}
+
+.stats-box-header {
+  font-size: 14px;
+  font-weight: 600;
+  color: #e0e6ed;
+  margin-bottom: 16px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid rgba(30, 58, 95, 0.4);
+}
+
+/* 消息统计 */
+.msg-stats {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 12px;
+}
+
+.msg-stat-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 12px;
+  background: rgba(0, 0, 0, 0.2);
+  border-radius: 6px;
+}
+
+.msg-label {
+  font-size: 12px;
+  color: #8b9cb5;
+}
+
+.msg-value {
+  font-size: 16px;
+  font-weight: 700;
+  color: #e0e6ed;
+  font-family: 'Consolas', monospace;
+}
+
+.msg-value.highlight-blue { color: #00d4ff; }
+.msg-value.highlight-green { color: #00ff88; }
+.msg-value.highlight-cyan { color: #00ffff; }
+
+/* 饼图样式 */
+.pie-chart-container {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+}
+
+.pie-chart {
+  position: relative;
+  width: 120px;
+  height: 120px;
+  border-radius: 50%;
+  /* 背景由 :style 动态设置 */
+  transition: background 0.5s ease;
+}
+
+.pie-center {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 70px;
+  height: 70px;
+  background: rgba(10, 14, 23, 0.98);
+  border-radius: 50%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+}
+
+.pie-total {
+  font-size: 20px;
+  font-weight: 700;
+  color: #00d4ff;
+}
+
+.pie-label {
+  font-size: 11px;
+  color: #8b9cb5;
+}
+
+.pie-legend {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.legend-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.legend-color {
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+}
+
+.legend-text {
+  font-size: 12px;
+  color: #8b9cb5;
+  flex: 1;
+}
+
+.legend-value {
+  font-size: 14px;
+  font-weight: 600;
+  color: #e0e6ed;
+}
+
+/* 柱状图 */
+.bar-chart {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.bar-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.bar-label {
+  width: 90px;
+  font-size: 11px;
+  color: #8b9cb5;
+  text-align: right;
+}
+
+.bar-track {
+  flex: 1;
+  height: 20px;
+  background: rgba(0, 0, 0, 0.3);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.bar-fill {
+  height: 100%;
+  border-radius: 4px;
+  transition: width 0.5s ease;
+}
+
+.bar-value {
+  width: 30px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #e0e6ed;
+  text-align: right;
+}
+
+/* 信号分析样式 */
+.signal-overview {
+  display: flex;
+  gap: 32px;
+  margin-bottom: 24px;
+  padding: 20px;
+  background: rgba(0, 0, 0, 0.2);
+  border-radius: 12px;
+}
+
+.signal-gauge {
+  flex-shrink: 0;
+}
+
+.gauge-ring {
+  position: relative;
+  width: 140px;
+  height: 140px;
+}
+
+.gauge-ring svg {
+  transform: rotate(-90deg);
+}
+
+.gauge-bg {
+  fill: none;
+  stroke: rgba(30, 58, 95, 0.5);
+  stroke-width: 8;
+}
+
+.gauge-fill {
+  fill: none;
+  stroke-width: 8;
+  stroke-linecap: round;
+  transition: stroke-dasharray 0.5s ease;
+}
+
+.gauge-text {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  text-align: center;
+}
+
+.gauge-percent {
+  display: block;
+  font-size: 28px;
+  font-weight: 700;
+  color: #00ff88;
+}
+
+.gauge-label {
+  font-size: 12px;
+  color: #8b9cb5;
+}
+
+.signal-breakdown {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.signal-item {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.signal-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.signal-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+}
+
+.signal-name {
+  font-size: 13px;
+  color: #e0e6ed;
+}
+
+.signal-bar-container {
+  height: 8px;
+  background: rgba(0, 0, 0, 0.3);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.signal-bar {
+  height: 100%;
+  border-radius: 4px;
+  transition: width 0.5s ease;
+}
+
+.signal-stats {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+  color: #8b9cb5;
+}
+
+.signal-count {
+  font-weight: 600;
+}
+
+/* 信号详情表格 */
+.signal-detail-list {
+  background: rgba(0, 0, 0, 0.2);
+  border-radius: 12px;
+  padding: 16px;
+}
+
+.signal-table {
+  margin-top: 12px;
+}
+
+.signal-table-header {
+  display: grid;
+  grid-template-columns: 2fr 1fr 1fr 1fr 1fr;
+  gap: 12px;
+  padding: 10px 12px;
+  background: rgba(0, 212, 255, 0.1);
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #00d4ff;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.signal-table-body {
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.signal-table-row {
+  display: grid;
+  grid-template-columns: 2fr 1fr 1fr 1fr 1fr;
+  gap: 12px;
+  padding: 10px 12px;
+  border-bottom: 1px solid rgba(30, 58, 95, 0.3);
+  font-size: 12px;
+  color: #e0e6ed;
+  align-items: center;
+}
+
+.signal-table-row:hover {
+  background: rgba(0, 212, 255, 0.05);
+}
+
+.flight-name {
+  font-weight: 600;
+}
+
+.nic-value {
+  font-family: 'Consolas', monospace;
+  font-weight: 700;
+  color: #00d4ff;
+}
+
+.quality-badge {
+  padding: 3px 8px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 600;
+  text-align: center;
+}
+
+.quality-badge.good {
+  background: rgba(0, 255, 136, 0.2);
+  color: #00ff88;
+}
+
+.quality-badge.medium {
+  background: rgba(255, 170, 51, 0.2);
+  color: #ffaa33;
+}
+
+.quality-badge.poor {
+  background: rgba(255, 71, 87, 0.2);
+  color: #ff4757;
+}
+
+/* 航空公司统计 */
+.airline-summary {
+  display: flex;
+  gap: 24px;
+  justify-content: center;
+  margin-bottom: 24px;
+  padding: 20px;
+  background: linear-gradient(135deg, rgba(0, 212, 255, 0.1) 0%, rgba(0, 128, 255, 0.05) 100%);
+  border-radius: 12px;
+}
+
+.summary-stat {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+
+.summary-value {
+  font-size: 36px;
+  font-weight: 700;
+  color: #00d4ff;
+  text-shadow: 0 0 20px rgba(0, 212, 255, 0.4);
+}
+
+.summary-label {
+  font-size: 13px;
+  color: #8b9cb5;
+}
+
+.airline-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.airline-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 16px;
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid rgba(30, 58, 95, 0.4);
+  border-radius: 10px;
+  transition: all 0.3s ease;
+}
+
+.airline-item:hover {
+  border-color: rgba(0, 212, 255, 0.4);
+  background: rgba(0, 212, 255, 0.05);
+}
+
+.airline-info {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.airline-logo {
+  width: 48px;
+  height: 48px;
+  background: linear-gradient(135deg, #00d4ff, #0080ff);
+  border-radius: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  font-weight: 700;
+  color: white;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+}
+
+.airline-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.airline-name {
+  font-size: 14px;
+  font-weight: 600;
+  color: #e0e6ed;
+}
+
+.airline-meta {
+  font-size: 11px;
+  color: #8b9cb5;
+}
+
+.airline-stats {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.airline-count {
+  font-size: 24px;
+  font-weight: 700;
+  color: #00d4ff;
+  min-width: 40px;
+  text-align: right;
+}
+
+.airline-bar-container {
+  width: 100px;
+  height: 8px;
+  background: rgba(0, 0, 0, 0.3);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.airline-bar {
+  height: 100%;
+  background: linear-gradient(90deg, #00d4ff, #0080ff);
+  border-radius: 4px;
+  transition: width 0.5s ease;
+}
+
+.empty-airline {
+  text-align: center;
+  padding: 40px;
+  color: #8b9cb5;
+  font-size: 14px;
 }
 </style>
