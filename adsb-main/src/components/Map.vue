@@ -6,6 +6,8 @@ import 'leaflet.heat';
 import { AdsbSimulator, AdsbDecoder, type DecodedPosition, type DecodedVelocity } from '../utils/adsb';
 import { AdsbRecorder, ReplayEngine, StorageManager, type PlaybackState } from '../utils/recorder';
 import type { AircraftState, TrajectoryPoint, AircraftTrajectory } from '../utils/types';
+import { RealAdsbDecoder, CsvDataLoader, RealDataReplayEngine, type RealDecodedData, type RealDecodedPosition, type RealDecodedVelocity, type RealDecodedIdentification } from '../utils/realAdsbDecoder';
+import { getAirlineByCallsign, formatFlightInfo, analyzeAirlines, getCountryByIcao, type AirlineInfo } from '../utils/airlineDatabase';
 
 // Tauri API 导入
 import { invoke } from '@tauri-apps/api/core';
@@ -32,6 +34,7 @@ const searchQuery = ref<string>('');
 const showSidebar = ref<boolean>(true);  // 控制侧边栏显示
 const showLogs = ref<boolean>(true);     // 控制日志面板显示
 const showReplayPanel = ref<boolean>(false); // 控制数据回放浮窗显示
+const isReplayPanelMinimized = ref<boolean>(false); // 控制数据回放浮窗是否最小化
 const replayPanelPosition = ref({ x: 50, y: 50 }); // 浮窗位置
 const isDraggingReplayPanel = ref<boolean>(false); // 是否正在拖动浮窗
 const mouseDownPos = ref({ x: 0, y: 0 }); // 鼠标按下时的绝对坐标
@@ -47,8 +50,23 @@ let simulationInterval: number | null = null;
 const recorder = new AdsbRecorder();
 const replayEngine = new ReplayEngine();
 
-// 模式: 'simulation' | 'recording' | 'replay'
-const mode = ref<'simulation' | 'recording' | 'replay'>('simulation');
+// ==================== 真实 CSV 数据回放 ====================
+const realDataEngine = new RealDataReplayEngine();
+const realDataDecoder = new RealAdsbDecoder();
+const csvFileInputRef = ref<HTMLInputElement | null>(null);
+const realDataMode = ref<boolean>(false);  // 是否处于真实数据回放模式
+const realDataState = ref({
+  isPlaying: false,
+  isPaused: false,
+  currentIndex: 0,
+  totalMessages: 0,
+  messagesPerSecond: 100  // 默认速度提高到100条/秒
+});
+const realDataProgress = ref<number>(0);  // 真实数据回放进度 (0-100)
+const isRealDataSeeking = ref<boolean>(false);  // 是否正在拖动进度条
+
+// 模式: 'simulation' | 'recording' | 'replay' | 'realdata'
+const mode = ref<'simulation' | 'recording' | 'replay' | 'realdata'>('simulation');
 const playbackState = ref<PlaybackState>('idle');
 const playbackSpeed = ref<number>(1.0);
 const playbackProgress = ref<number>(0);
@@ -156,13 +174,12 @@ const createHeatmapLayer = () => {
         const radius = 80; 
         const gradient = ctx.createRadialGradient(point.x, point.y, 0, point.x, point.y, radius);
         
-        // Gaussian-like decay with low alpha for accumulation
-        // This creates the "hotspot" effect when points overlap
-        // 降低透明度以避免累积过亮
-        gradient.addColorStop(0, `hsla(${hue}, 80%, 45%, ${0.06 * alphaScale})`);
-        gradient.addColorStop(0.3, `hsla(${hue}, 80%, 40%, ${0.03 * alphaScale})`);
-        gradient.addColorStop(0.6, `hsla(${hue}, 80%, 40%, ${0.008 * alphaScale})`);
-        gradient.addColorStop(1, `hsla(${hue}, 80%, 40%, 0)`);
+        // Gaussian-like decay with very low alpha for accumulation
+        // 大幅降低透明度，避免累积过亮
+        gradient.addColorStop(0, `hsla(${hue}, 70%, 35%, ${0.025 * alphaScale})`);
+        gradient.addColorStop(0.3, `hsla(${hue}, 70%, 30%, ${0.012 * alphaScale})`);
+        gradient.addColorStop(0.6, `hsla(${hue}, 70%, 30%, ${0.004 * alphaScale})`);
+        gradient.addColorStop(1, `hsla(${hue}, 70%, 30%, 0)`);
         
         ctx.fillStyle = gradient;
         ctx.arc(point.x, point.y, radius, 0, Math.PI * 2);
@@ -476,21 +493,37 @@ const updateMap = (replayTargetTime?: number) => {
     let marker = markers.value.get(aircraft.id);
     const newLatLng = new L.LatLng(aircraft.lat, aircraft.lng);
 
+    // 生成显示名称：优先显示呼号，否则显示 ICAO 地址
+    const displayName = aircraft.callsign || `[${aircraft.id}]`;
+    const callsignStatus = aircraft.callsign 
+      ? `<span style="color:#4ade80">✓ ${aircraft.callsign}</span>` 
+      : `<span style="color:#fbbf24">⏳ 等待识别消息...</span>`;
+    
+    const popupContent = `
+      <div style="min-width: 180px;">
+        <b style="font-size: 14px;">${displayName}</b><br>
+        <hr style="margin: 4px 0; border-color: #444;">
+        <table style="font-size: 12px; width: 100%;">
+          <tr><td>ICAO地址:</td><td><code>${aircraft.id}</code></td></tr>
+          <tr><td>呼号:</td><td>${callsignStatus}</td></tr>
+          <tr><td>高度:</td><td>${aircraft.altitude.toFixed(0)} ft</td></tr>
+          <tr><td>速度:</td><td>${aircraft.speed.toFixed(0)} kts</td></tr>
+          <tr><td>航向:</td><td>${aircraft.heading.toFixed(0)}°</td></tr>
+          <tr><td>NIC:</td><td>${aircraft.nic} (GNSS精度)</td></tr>
+        </table>
+      </div>
+    `;
+
     if (marker) {
       marker.setLatLng(newLatLng);
       marker.setIcon(createPlaneIcon(aircraft.heading, aircraft.nic));
-      marker.setPopupContent(`
-        <b>ICAO: ${aircraft.id}</b><br>
-        NIC: ${aircraft.nic} (GNSS Quality)<br>
-        Alt: ${aircraft.altitude.toFixed(0)} ft<br>
-        Speed: ${aircraft.speed.toFixed(0)} kts
-      `);
+      marker.setPopupContent(popupContent);
     } else {
       marker = L.marker(newLatLng, {
         icon: createPlaneIcon(aircraft.heading, aircraft.nic)
       });
       if (aircraftLayer) marker.addTo(aircraftLayer); // Add to aircraft layer
-      marker.bindPopup(`<b>ICAO: ${aircraft.id}</b>`);
+      marker.bindPopup(popupContent);
       markers.value.set(aircraft.id, marker);
     }
   });
@@ -999,9 +1032,290 @@ const triggerFileInput = () => {
   fileInputRef.value?.click();
 };
 
+/**
+ * 触发 CSV 文件输入
+ */
+const triggerCsvFileInput = () => {
+  csvFileInputRef.value?.click();
+};
+
+/**
+ * 加载真实 CSV 数据文件
+ */
+const loadCsvDataFile = async (event: Event) => {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0];
+  if (!file) return;
+
+  try {
+    // 解析 CSV 文件
+    const messages = await CsvDataLoader.loadFromFile(file);
+    
+    if (messages.length === 0) {
+      logs.value.unshift(`[System] ⚠️ CSV 文件中没有有效的 ADS-B 消息`);
+      return;
+    }
+
+    // 保存当前数据源
+    previousDataSource.value = dataSource.value;
+    
+    // 停止当前模拟
+    if (simulationInterval) {
+      clearInterval(simulationInterval);
+      simulationInterval = null;
+    }
+    
+    // 停止 Rust 后端模拟
+    if (dataSource.value === 'backend') {
+      await stopRustSimulation();
+      dataSource.value = 'frontend';
+    }
+
+    // 切换到真实数据回放模式
+    mode.value = 'realdata';
+    realDataMode.value = true;
+    
+    // 清空当前状态
+    clearCurrentState();
+    
+    // 设置参考位置（深圳）
+    realDataDecoder.setReferencePosition(22.5431, 114.0579);
+    realDataEngine.setReferencePosition(22.5431, 114.0579);
+    
+    // 加载消息到回放引擎
+    realDataEngine.loadMessages(messages);
+    
+    // 设置回调
+    realDataEngine.setCallbacks({
+      onMessage: (result, hex) => {
+        handleRealDataMessage(result, hex);
+      },
+      onStateChange: (state) => {
+        realDataState.value = state;
+        // 更新进度条（非拖动状态下）
+        if (!isRealDataSeeking.value && state.totalMessages > 0) {
+          realDataProgress.value = (state.currentIndex / state.totalMessages) * 100;
+        }
+      },
+      onBatchComplete: () => {
+        // 批量处理完成后更新地图
+        updateMap();
+      },
+      onFinished: () => {
+        logs.value.unshift(`[System] ✅ 真实数据回放完成`);
+      }
+    });
+
+    logs.value.unshift(`[System] 📂 已加载 CSV 文件: ${file.name}, 共 ${messages.length} 条消息`);
+    
+    // 更新地图
+    updateMap();
+  } catch (error) {
+    console.error('Failed to load CSV file:', error);
+    logs.value.unshift(`[System] ❌ 加载 CSV 文件失败: ${error}`);
+  }
+  
+  // 重置文件输入
+  input.value = '';
+};
+
+/**
+ * 处理真实数据消息
+ */
+const handleRealDataMessage = (result: { icao: string; data: RealDecodedData } | null, hex: string) => {
+  // 记录日志
+  logs.value.unshift(`[RX-Real] ${hex}`);
+  if (logs.value.length > 50) logs.value.pop();
+
+  if (!result || !result.data) return;
+
+  const { icao, data } = result;
+  
+  let state = aircrafts.value.get(icao);
+  if (!state) {
+    state = {
+      id: icao,
+      lat: 0,
+      lng: 0,
+      heading: 0,
+      speed: 0,
+      altitude: 0,
+      nic: 0,
+      callsign: '',  // 空字符串表示尚未收到识别消息
+      lastSeen: 0
+    };
+    aircrafts.value.set(icao, state);
+  }
+
+  state.lastSeen = Date.now();
+
+  if (data.type === 'position') {
+    const pos = data as RealDecodedPosition;
+    // 只更新有效位置（lat/lng 不为 0）
+    if (pos.lat !== 0 && pos.lng !== 0) {
+      state.lat = pos.lat;
+      state.lng = pos.lng;
+    }
+    state.altitude = pos.altitude;
+    state.nic = pos.nic;
+    
+    updateMessageStats('position');
+    
+    // 添加轨迹点
+    if (pos.lat !== 0 && pos.lng !== 0) {
+      addTrajectoryPoint(icao, {
+        lat: pos.lat,
+        lng: pos.lng,
+        altitude: pos.altitude,
+        heading: state.heading,
+        speed: state.speed,
+        nic: pos.nic,
+        timestamp: Date.now()
+      });
+    }
+  } else if (data.type === 'velocity') {
+    const vel = data as RealDecodedVelocity;
+    state.speed = vel.speed;
+    state.heading = vel.heading;
+    
+    updateMessageStats('velocity');
+  } else if (data.type === 'identification') {
+    const id = data as RealDecodedIdentification;
+    state.callsign = id.callsign;
+    
+    updateMessageStats('identification');
+  }
+
+  // 注意：地图更新由 onBatchComplete 回调统一处理，提高性能
+};
+
+/**
+ * 播放真实数据
+ */
+const playRealData = () => {
+  realDataEngine.play();
+};
+
+/**
+ * 暂停真实数据回放
+ */
+const pauseRealData = () => {
+  realDataEngine.pause();
+};
+
+/**
+ * 恢复真实数据回放
+ */
+const resumeRealData = () => {
+  realDataEngine.resume();
+};
+
+/**
+ * 停止真实数据回放
+ */
+const stopRealData = () => {
+  realDataEngine.stop();
+};
+
+/**
+ * 设置真实数据播放速度
+ */
+const setRealDataSpeed = (speed: number) => {
+  realDataEngine.setSpeed(speed);
+};
+
+/**
+ * 真实数据进度条开始拖动
+ */
+const onRealDataSeekStart = () => {
+  isRealDataSeeking.value = true;
+  // 暂停播放
+  if (realDataState.value.isPlaying && !realDataState.value.isPaused) {
+    realDataEngine.pause();
+  }
+};
+
+/**
+ * 真实数据进度条拖动结束
+ */
+const onRealDataSeekEnd = () => {
+  isRealDataSeeking.value = false;
+  // 执行跳转
+  realDataEngine.seekToPercent(realDataProgress.value);
+  // 清空当前显示状态并重建
+  rebuildRealDataState();
+};
+
+/**
+ * 真实数据进度条拖动中
+ */
+const onRealDataSeekInput = (event: Event) => {
+  const target = event.target as HTMLInputElement;
+  realDataProgress.value = parseFloat(target.value);
+};
+
+/**
+ * 重建真实数据状态（跳转后需要重新显示飞机）
+ */
+const rebuildRealDataState = () => {
+  // 清空当前飞机显示
+  aircrafts.value.clear();
+  markers.value.forEach((marker) => {
+    if (aircraftLayer) aircraftLayer.removeLayer(marker as any);
+  });
+  markers.value.clear();
+  
+  // 清空轨迹
+  trajectories.value.clear();
+  trajectoryLines.value.forEach((line) => {
+    if (trajectoryLayer) trajectoryLayer.removeLayer(line as any);
+  });
+  trajectoryLines.value.clear();
+  
+  // 更新地图
+  updateMap();
+  
+  logs.value.unshift(`[System] 📍 跳转到 ${realDataProgress.value.toFixed(1)}%`);
+};
+
+/**
+ * 返回模拟模式（从真实数据模式）
+ */
+const backToSimulationFromRealData = async () => {
+  // 停止真实数据回放
+  realDataEngine.stop();
+  realDataMode.value = false;
+  
+  // 清空状态
+  clearCurrentState();
+  
+  // 恢复到模拟模式
+  mode.value = 'simulation';
+  
+  // 恢复之前的数据源
+  if (previousDataSource.value === 'backend') {
+    dataSource.value = 'backend';
+    await startRustSimulation();
+  } else {
+    dataSource.value = 'frontend';
+    // 重新启动前端模拟
+    if (map) {
+      const center = map.getCenter();
+      generateMockAircraft();
+      simulationInterval = window.setInterval(() => {
+        processSignal();
+        updateMap();
+      }, 1000);
+    }
+  }
+  
+  logs.value.unshift(`[System] 🔄 已返回模拟模式`);
+};
+
 // Computed properties
 const isRecording = computed(() => mode.value === 'recording');
 const isReplaying = computed(() => mode.value === 'replay');
+const isRealDataMode = computed(() => mode.value === 'realdata');
 const canRecord = computed(() => mode.value === 'simulation');
 const canReplay = computed(() => mode.value !== 'recording');
 
@@ -1165,6 +1479,90 @@ const selectedPlane = computed(() => {
   return aircrafts.value.get(selectedPlaneId.value) || null;
 });
 
+// 选中飞机的航空公司信息
+const selectedPlaneAirline = computed(() => {
+  if (!selectedPlane.value) return null;
+  return getAirlineByCallsign(selectedPlane.value.callsign);
+});
+
+// 获取飞机的航空公司显示信息
+const getAirlineDisplay = (aircraft: AircraftState) => {
+  const airline = getAirlineByCallsign(aircraft.callsign);
+  if (airline) {
+    return {
+      name: airline.name,
+      nameEn: airline.nameEn,
+      country: airline.country,
+      known: true
+    };
+  }
+  const country = getCountryByIcao(aircraft.id);
+  return {
+    name: '未知航空公司',
+    nameEn: 'Unknown Airline',
+    country: country,
+    known: false
+  };
+};
+
+// 航空公司统计分析
+const airlineAnalysis = computed(() => {
+  const callsigns: string[] = [];
+  aircrafts.value.forEach((aircraft) => {
+    if (aircraft.callsign && aircraft.callsign !== 'Unknown') {
+      callsigns.push(aircraft.callsign);
+    } else {
+      callsigns.push('Unknown');
+    }
+  });
+  return analyzeAirlines(callsigns);
+});
+
+// 未知航空公司列表（按出现次数排序）
+const unknownAirlinesList = computed(() => {
+  const result: { prefix: string; count: number; sampleCallsigns: string[] }[] = [];
+  const prefixMap = new Map<string, string[]>();
+  
+  // 收集每个未知前缀的呼号样本
+  aircrafts.value.forEach((aircraft) => {
+    if (aircraft.callsign && aircraft.callsign !== 'Unknown') {
+      const airline = getAirlineByCallsign(aircraft.callsign);
+      if (!airline) {
+        const prefix = aircraft.callsign.substring(0, 3).toUpperCase();
+        if (!prefixMap.has(prefix)) {
+          prefixMap.set(prefix, []);
+        }
+        const samples = prefixMap.get(prefix)!;
+        if (samples.length < 3) {
+          samples.push(aircraft.callsign);
+        }
+      }
+    }
+  });
+  
+  // 转换为数组并排序
+  airlineAnalysis.value.unknown.forEach((count, prefix) => {
+    if (prefix !== 'NO_CALLSIGN') {
+      result.push({
+        prefix,
+        count,
+        sampleCallsigns: prefixMap.get(prefix) || []
+      });
+    }
+  });
+  
+  return result.sort((a, b) => b.count - a.count);
+});
+
+// 已知航空公司列表（按出现次数排序）
+const knownAirlinesList = computed(() => {
+  const result: { airline: AirlineInfo; count: number }[] = [];
+  airlineAnalysis.value.known.forEach((data) => {
+    result.push(data);
+  });
+  return result.sort((a, b) => b.count - a.count);
+});
+
 // 按信号质量(NIC)排序的飞机列表（用于态势显示模式底部列表）
 const planesListByNic = computed(() => {
   const planes: AircraftState[] = [];
@@ -1178,6 +1576,22 @@ const planesListByNic = computed(() => {
   return planes.sort((a, b) => b.nic - a.nic);
 });
 
+// 呼号识别率统计
+const callsignStats = computed(() => {
+  const validPlanes = planesListByNic.value;
+  const total = validPlanes.length;
+  const identified = validPlanes.filter(p => p.callsign && p.callsign.trim() !== '').length;
+  const pending = total - identified;
+  const rate = total > 0 ? ((identified / total) * 100).toFixed(1) : '0.0';
+  
+  return {
+    total,
+    identified,
+    pending,
+    rate
+  };
+});
+
 // ==================== 高级统计分析 ====================
 // 统计分析面板当前Tab
 const statsActiveTab = ref<'overview' | 'flight' | 'signal' | 'airline'>('overview');
@@ -1187,16 +1601,18 @@ const messageStats = ref({
   totalMessages: 0,
   positionMessages: 0,
   velocityMessages: 0,
+  identificationMessages: 0,  // 识别消息计数
   lastMinuteMessages: 0,
   messagesPerSecond: 0
 });
 const recentMessageTimestamps: number[] = [];
 
 // 更新消息统计（在handleReceivedMessage中调用）
-const updateMessageStats = (msgType: 'position' | 'velocity' | 'other') => {
+const updateMessageStats = (msgType: 'position' | 'velocity' | 'identification' | 'other') => {
   messageStats.value.totalMessages++;
   if (msgType === 'position') messageStats.value.positionMessages++;
   else if (msgType === 'velocity') messageStats.value.velocityMessages++;
+  else if (msgType === 'identification') messageStats.value.identificationMessages++;
   
   const now = Date.now();
   recentMessageTimestamps.push(now);
@@ -1307,34 +1723,57 @@ const nicPieChartStyle = computed(() => {
   };
 });
 
-// 航空公司统计
+// 航空公司统计（使用新的航空公司数据库）
 const airlineStats = computed(() => {
   const validPlanes = planesListByNic.value;
-  const airlines: Record<string, { name: string; count: number; avgNic: number; planes: AircraftState[] }> = {};
-  
-  // 航空公司代码映射
-  const airlineNames: Record<string, string> = {
-    'CZ': '中国南方航空',
-    'CA': '中国国际航空',
-    'MU': '中国东方航空',
-    'BZ': '海南航空',
-    'FM': '上海航空',
-    'ZH': '深圳航空',
-    '3U': '四川航空',
-    'HU': '海南航空',
-    'SC': '山东航空',
-    'MF': '厦门航空'
-  };
+  const airlines: Record<string, { 
+    name: string; 
+    nameEn: string;
+    count: number; 
+    avgNic: number; 
+    planes: AircraftState[];
+    isKnown: boolean;
+    country: string;
+  }> = {};
   
   validPlanes.forEach(p => {
-    const prefix = p.callsign?.substring(0, 2) || 'Unknown';
-    const airlineName = airlineNames[prefix] || `其他(${prefix})`;
+    const callsign = p.callsign || 'Unknown';
+    const airlineInfo = getAirlineByCallsign(callsign);
     
-    if (!airlines[prefix]) {
-      airlines[prefix] = { name: airlineName, count: 0, avgNic: 0, planes: [] };
+    let key: string;
+    let name: string;
+    let nameEn: string;
+    let isKnown: boolean;
+    let country: string;
+    
+    if (airlineInfo) {
+      key = airlineInfo.icaoCode;
+      name = airlineInfo.name;
+      nameEn = airlineInfo.nameEn;
+      isKnown = true;
+      country = airlineInfo.country;
+    } else {
+      // 未知航空公司，按前缀分组
+      const prefix = callsign.substring(0, 3).toUpperCase();
+      if (callsign === 'Unknown') {
+        key = 'NO_ID';
+        name = '未识别航班';
+        nameEn = 'Unidentified';
+        country = getCountryByIcao(p.id);
+      } else {
+        key = `UNK_${prefix}`;
+        name = `未知 (${prefix})`;
+        nameEn = `Unknown (${prefix})`;
+        country = getCountryByIcao(p.id);
+      }
+      isKnown = false;
     }
-    airlines[prefix].count++;
-    airlines[prefix].planes.push(p);
+    
+    if (!airlines[key]) {
+      airlines[key] = { name, nameEn, count: 0, avgNic: 0, planes: [], isKnown, country };
+    }
+    airlines[key].count++;
+    airlines[key].planes.push(p);
   });
   
   // 计算平均NIC
@@ -1342,10 +1781,37 @@ const airlineStats = computed(() => {
     airline.avgNic = Math.round(airline.planes.reduce((sum, p) => sum + p.nic, 0) / airline.planes.length * 10) / 10;
   });
   
-  // 按数量排序并返回数组
+  // 按数量排序并返回数组（已知航空公司在前）
   return Object.entries(airlines)
-    .sort((a, b) => b[1].count - a[1].count)
+    .sort((a, b) => {
+      // 已知航空公司排在前面
+      if (a[1].isKnown !== b[1].isKnown) {
+        return a[1].isKnown ? -1 : 1;
+      }
+      // 同类型按数量排序
+      return b[1].count - a[1].count;
+    })
     .map(([code, data]) => ({ code, ...data }));
+});
+
+// 未知航空公司呼号列表（用于分析）
+const unknownCallsignList = computed(() => {
+  const result: { callsign: string; icao: string; country: string }[] = [];
+  
+  aircrafts.value.forEach((aircraft) => {
+    if (aircraft.callsign && aircraft.callsign !== 'Unknown') {
+      const airline = getAirlineByCallsign(aircraft.callsign);
+      if (!airline) {
+        result.push({
+          callsign: aircraft.callsign,
+          icao: aircraft.id,
+          country: getCountryByIcao(aircraft.id)
+        });
+      }
+    }
+  });
+  
+  return result;
 });
 
 // 获取分布图最大值（用于计算百分比高度）
@@ -1441,6 +1907,11 @@ const onMouseUp = () => {
             <span class="mode-text">回放模式</span>
             <span class="replay-progress">{{ formatTime(playbackCurrentTime) }}</span>
           </div>
+          <div v-else-if="mode === 'realdata'" class="mode-badge mode-realdata">
+            <span class="mode-icon">📊</span>
+            <span class="mode-text">真实数据</span>
+            <span class="realdata-progress">{{ realDataState.currentIndex }}/{{ realDataState.totalMessages }}</span>
+          </div>
         </div>
         <div class="datetime">
           <span class="date">{{ currentDate }}</span>
@@ -1449,6 +1920,9 @@ const onMouseUp = () => {
         <div class="data-source-badge">
           <span v-if="mode === 'replay'" class="badge replay">
             💼 录制回放
+          </span>
+          <span v-else-if="mode === 'realdata'" class="badge realdata">
+            📊 真实数据
           </span>
           <span v-else class="badge" :class="dataSource">
             {{ dataSource === 'backend' ? '🦀 Rust后端' : '📺 前端模拟' }}
@@ -1543,6 +2017,12 @@ const onMouseUp = () => {
               <div class="aircraft-visual">
                 <div class="aircraft-icon-large">✈️</div>
                 <div class="aircraft-callsign">{{ selectedPlane.callsign || selectedPlane.id }}</div>
+                <div v-if="selectedPlaneAirline" class="aircraft-airline">
+                  {{ selectedPlaneAirline.name }}
+                </div>
+                <div v-else class="aircraft-airline unknown">
+                  {{ getAirlineDisplay(selectedPlane).name }} · {{ getAirlineDisplay(selectedPlane).country }}
+                </div>
               </div>
               <div class="aircraft-params">
                 <div class="param-row">
@@ -1553,6 +2033,12 @@ const onMouseUp = () => {
                   <div class="param">
                     <span class="param-label">航班号</span>
                     <span class="param-value">{{ selectedPlane.callsign }}</span>
+                  </div>
+                </div>
+                <div v-if="selectedPlaneAirline" class="param-row">
+                  <div class="param full-width">
+                    <span class="param-label">航空公司</span>
+                    <span class="param-value">{{ selectedPlaneAirline.name }} ({{ selectedPlaneAirline.icaoCode }})</span>
                   </div>
                 </div>
                 <div class="param-row">
@@ -1665,6 +2151,9 @@ const onMouseUp = () => {
           <div class="quick-targets-header">
             <span class="qt-header-icon">✈️</span>
             <span class="qt-header-text">目标列表 ({{ planesListByNic.length }}) - 按信号质量排序</span>
+            <span class="qt-callsign-stats" :title="`已收到呼号: ${callsignStats.identified}/${callsignStats.total}`">
+              📡 {{ callsignStats.rate }}% 已识别
+            </span>
           </div>
           <div class="quick-targets-scroll">
             <div v-for="plane in planesListByNic" :key="plane.id" 
@@ -1673,7 +2162,10 @@ const onMouseUp = () => {
                  @click="selectAndFocusPlane(plane)">
               <span v-if="lockedPlaneId === plane.id" class="qt-lock-icon">🔒</span>
               <span v-else class="qt-icon">✈️</span>
-              <span class="qt-name">{{ plane.callsign || plane.id }}</span>
+              <span class="qt-name" :class="{ 'qt-pending': !plane.callsign }">
+                {{ plane.callsign || `[${plane.id}]` }}
+              </span>
+              <span v-if="!plane.callsign" class="qt-pending-badge" title="等待识别消息">⏳</span>
               <span :class="['qt-nic', plane.nic >= 8 ? 'good' : plane.nic >= 4 ? 'medium' : 'poor']">{{ plane.nic }}</span>
             </div>
           </div>
@@ -1910,8 +2402,12 @@ const onMouseUp = () => {
             <div v-if="statsActiveTab === 'airline'" class="stats-content">
               <div class="airline-summary">
                 <div class="summary-stat">
-                  <span class="summary-value">{{ airlineStats.length }}</span>
-                  <span class="summary-label">航空公司</span>
+                  <span class="summary-value">{{ airlineStats.filter(a => a.isKnown).length }}</span>
+                  <span class="summary-label">已识别航空公司</span>
+                </div>
+                <div class="summary-stat">
+                  <span class="summary-value">{{ airlineStats.filter(a => !a.isKnown).length }}</span>
+                  <span class="summary-label">未识别</span>
                 </div>
                 <div class="summary-stat">
                   <span class="summary-value">{{ aircrafts.size }}</span>
@@ -1919,26 +2415,67 @@ const onMouseUp = () => {
                 </div>
               </div>
               
-              <div class="airline-list">
-                <div class="airline-item" v-for="airline in airlineStats" :key="airline.code">
-                  <div class="airline-info">
-                    <div class="airline-logo">{{ airline.code }}</div>
-                    <div class="airline-detail">
-                      <span class="airline-name">{{ airline.name }}</span>
-                      <span class="airline-meta">平均NIC: {{ airline.avgNic }}</span>
+              <!-- 已识别航空公司 -->
+              <div class="airline-section">
+                <div class="section-header">✅ 已识别航空公司</div>
+                <div class="airline-list">
+                  <div class="airline-item known" v-for="airline in airlineStats.filter(a => a.isKnown)" :key="airline.code">
+                    <div class="airline-info">
+                      <div class="airline-logo">{{ airline.code }}</div>
+                      <div class="airline-detail">
+                        <span class="airline-name">{{ airline.name }}</span>
+                        <span class="airline-meta">{{ airline.country }} · 平均NIC: {{ airline.avgNic }}</span>
+                      </div>
                     </div>
-                  </div>
-                  <div class="airline-stats">
-                    <div class="airline-count">{{ airline.count }}</div>
-                    <div class="airline-bar-container">
-                      <div class="airline-bar" :style="{ 
-                        width: (airline.count / (airlineStats[0]?.count || 1) * 100) + '%'
-                      }"></div>
+                    <div class="airline-stats">
+                      <div class="airline-count">{{ airline.count }}</div>
+                      <div class="airline-bar-container">
+                        <div class="airline-bar known" :style="{ 
+                          width: (airline.count / (airlineStats[0]?.count || 1) * 100) + '%'
+                        }"></div>
+                      </div>
                     </div>
                   </div>
                 </div>
-                <div v-if="airlineStats.length === 0" class="empty-airline">暂无航班数据</div>
               </div>
+              
+              <!-- 未识别航空公司 -->
+              <div class="airline-section">
+                <div class="section-header">❓ 未识别航空公司 (可能需要添加到数据库)</div>
+                <div class="airline-list">
+                  <div class="airline-item unknown" v-for="airline in airlineStats.filter(a => !a.isKnown)" :key="airline.code">
+                    <div class="airline-info">
+                      <div class="airline-logo unknown">{{ airline.code.replace('UNK_', '').replace('NO_ID', '?') }}</div>
+                      <div class="airline-detail">
+                        <span class="airline-name">{{ airline.name }}</span>
+                        <span class="airline-meta">{{ airline.country }} · 平均NIC: {{ airline.avgNic }}</span>
+                      </div>
+                    </div>
+                    <div class="airline-stats">
+                      <div class="airline-count">{{ airline.count }}</div>
+                      <div class="airline-bar-container">
+                        <div class="airline-bar unknown" :style="{ 
+                          width: (airline.count / (airlineStats[0]?.count || 1) * 100) + '%'
+                        }"></div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              
+              <!-- 未识别呼号详情 -->
+              <div v-if="unknownCallsignList.length > 0" class="airline-section">
+                <div class="section-header">📋 未识别航班呼号明细 (前20个)</div>
+                <div class="unknown-callsign-list">
+                  <div class="callsign-item" v-for="item in unknownCallsignList.slice(0, 20)" :key="item.icao">
+                    <span class="callsign-code">{{ item.callsign }}</span>
+                    <span class="callsign-icao">ICAO: {{ item.icao }}</span>
+                    <span class="callsign-country">{{ item.country }}</span>
+                  </div>
+                </div>
+              </div>
+              
+              <div v-if="airlineStats.length === 0" class="empty-airline">暂无航班数据</div>
             </div>
           </div>
         </div>
@@ -1967,10 +2504,13 @@ const onMouseUp = () => {
     </div>
 
     <!-- 数据回放浮窗 -->
-    <div v-if="showReplayPanel" class="replay-panel" :style="{ left: replayPanelPosition.x + 'px', top: replayPanelPosition.y + 'px' }">
+    <div v-if="showReplayPanel && !isReplayPanelMinimized" class="replay-panel" :style="{ left: replayPanelPosition.x + 'px', top: replayPanelPosition.y + 'px' }">
       <div class="replay-panel-header" @mousedown="onReplayPanelMouseDown">
         <h3>🎬 数据回放控制</h3>
-        <button class="close-btn" @click.stop="closeReplayPanel">×</button>
+        <div class="header-buttons">
+          <button class="minimize-btn" @click.stop="isReplayPanelMinimized = true" title="最小化">─</button>
+          <button class="close-btn" @click.stop="closeReplayPanel" title="关闭">×</button>
+        </div>
       </div>
       <div class="replay-panel-body">
         <!-- 模式指示 -->
@@ -1978,10 +2518,11 @@ const onMouseUp = () => {
           <span v-if="mode === 'simulation'" class="badge badge-simulation">🟢 模拟模式</span>
           <span v-else-if="mode === 'recording'" class="badge badge-recording">🔴 正在录制</span>
           <span v-else-if="mode === 'replay'" class="badge badge-replay">▶️ 回放模式</span>
+          <span v-else-if="mode === 'realdata'" class="badge badge-realdata">📡 真实数据模式</span>
         </div>
 
         <!-- 录制控制 -->
-        <div v-if="!isReplaying" class="control-group">
+        <div v-if="!isReplaying && !isRealDataMode" class="control-group">
           <h5>📹 录制</h5>
           <button v-if="!isRecording" @click="startRecording" :disabled="!canRecord" class="btn btn-start">
             🔴 开始录制
@@ -2036,11 +2577,58 @@ const onMouseUp = () => {
           </label>
         </div>
 
+        <!-- 真实数据回放控制 -->
+        <div v-if="mode === 'realdata'" class="control-group">
+          <h5>📡 真实数据回放</h5>
+          <div class="button-row">
+            <button v-if="!realDataState.isPlaying || realDataState.isPaused" @click="playRealData" class="btn btn-play">▶️ 播放</button>
+            <button v-else @click="pauseRealData" class="btn btn-pause">⏸️ 暂停</button>
+            <button @click="stopRealData" class="btn btn-stop">⏹️ 重置</button>
+            <button @click="backToSimulationFromRealData" class="btn btn-back">↩️ 返回模拟</button>
+          </div>
+
+          <div class="speed-control">
+            <label>播放速度（消息/秒）：</label>
+            <button
+              v-for="speed in [10, 50, 100, 500, 1000]"
+              :key="speed"
+              :class="['btn-speed', { active: realDataState.messagesPerSecond === speed }]"
+              @click="setRealDataSpeed(speed)"
+            >
+              {{ speed }}
+            </button>
+          </div>
+
+          <!-- 进度条控制 -->
+          <div class="progress-control" @mousedown.stop>
+            <div class="time-display">
+              {{ realDataState.currentIndex.toLocaleString() }} / {{ realDataState.totalMessages.toLocaleString() }} 条消息
+            </div>
+            <input
+              type="range"
+              class="progress-slider"
+              :value="realDataProgress"
+              min="0"
+              max="100"
+              step="0.1"
+              @mousedown="onRealDataSeekStart"
+              @mouseup="onRealDataSeekEnd"
+              @input="onRealDataSeekInput"
+            />
+            <div class="progress-percent">{{ realDataProgress.toFixed(1) }}%</div>
+          </div>
+
+          <label class="trajectory-toggle">
+            <input v-model="showTrajectory" type="checkbox" @change="toggleTrajectory" />
+            <span>显示飞行轨迹</span>
+          </label>
+        </div>
+
         <!-- 文件操作 -->
         <div class="control-group">
           <h5>📁 文件</h5>
           <button v-if="canRecord" @click="downloadRecording" class="btn btn-download">⬇️ 下载录制</button>
-          <button @click="triggerFileInput" class="btn btn-load">⬆️ 加载录制</button>
+          <button @click="triggerFileInput" class="btn btn-load">⬆️ 加载录制 (JSON)</button>
           <input
             ref="fileInputRef"
             type="file"
@@ -2049,6 +2637,37 @@ const onMouseUp = () => {
             @change="loadRecordingFile"
           />
         </div>
+
+        <!-- 真实 CSV 数据加载 -->
+        <div class="control-group csv-section">
+          <h5>📊 真实 ADS-B 数据</h5>
+          <p class="csv-hint">加载包含真实 ADS-B hex 消息的 CSV 文件</p>
+          <button @click="triggerCsvFileInput" class="btn btn-csv" :disabled="isRecording">
+            📂 加载 CSV 数据
+          </button>
+          <input
+            ref="csvFileInputRef"
+            type="file"
+            accept=".csv,.txt"
+            style="display: none"
+            @change="loadCsvDataFile"
+          />
+        </div>
+      </div>
+    </div>
+
+    <!-- 最小化后的底部工具栏 -->
+    <div v-if="showReplayPanel && isReplayPanelMinimized" class="replay-minimized-bar">
+      <div class="minimized-content" @click="isReplayPanelMinimized = false">
+        <span class="minimized-icon">🎬</span>
+        <span class="minimized-title">数据回放控制</span>
+        <span v-if="mode === 'recording'" class="minimized-status recording">🔴 录制中</span>
+        <span v-else-if="mode === 'replay'" class="minimized-status playing">▶️ {{ formatTime(playbackCurrentTime) }}</span>
+        <span v-else-if="mode === 'realdata'" class="minimized-status realdata">📊 {{ realDataState.currentIndex }}/{{ realDataState.totalMessages }}</span>
+      </div>
+      <div class="minimized-actions">
+        <button class="restore-btn" @click="isReplayPanelMinimized = false" title="还原窗口">▢</button>
+        <button class="close-btn" @click="closeReplayPanel" title="关闭">×</button>
       </div>
     </div>
   </div>
@@ -2626,6 +3245,221 @@ const onMouseUp = () => {
   cursor: grabbing !important;
 }
 
+/* ==================== 浮窗头部按钮组 ==================== */
+.replay-panel-header .header-buttons {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.replay-panel-header .minimize-btn {
+  background: none;
+  border: none;
+  font-size: 16px;
+  color: #5a6270;
+  cursor: pointer;
+  transition: all 0.2s;
+  padding: 0;
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+}
+
+.replay-panel-header .minimize-btn:hover {
+  color: #00d4ff;
+  background: rgba(0, 212, 255, 0.1);
+}
+
+/* ==================== 最小化工具栏样式 ==================== */
+.replay-minimized-bar {
+  position: fixed;
+  bottom: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  background: linear-gradient(135deg, rgba(13, 19, 33, 0.98) 0%, rgba(10, 14, 23, 0.98) 100%);
+  border: 1px solid #1e3a5f;
+  border-bottom: none;
+  border-radius: 12px 12px 0 0;
+  box-shadow: 0 -4px 24px rgba(0, 0, 0, 0.4), 0 0 20px rgba(0, 212, 255, 0.1);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 16px;
+  z-index: 1500;
+  min-width: 320px;
+  gap: 16px;
+}
+
+.replay-minimized-bar .minimized-content {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+  flex: 1;
+  padding: 4px 8px;
+  border-radius: 6px;
+  transition: all 0.2s;
+}
+
+.replay-minimized-bar .minimized-content:hover {
+  background: rgba(0, 212, 255, 0.1);
+}
+
+.replay-minimized-bar .minimized-icon {
+  font-size: 16px;
+}
+
+.replay-minimized-bar .minimized-title {
+  color: #00d4ff;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.replay-minimized-bar .minimized-status {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-family: 'Consolas', monospace;
+}
+
+.replay-minimized-bar .minimized-status.recording {
+  background: rgba(255, 59, 48, 0.2);
+  color: #ff3b30;
+  animation: pulse-recording 1s infinite;
+}
+
+.replay-minimized-bar .minimized-status.playing {
+  background: rgba(52, 199, 89, 0.2);
+  color: #34c759;
+}
+
+.replay-minimized-bar .minimized-status.realdata {
+  background: rgba(0, 212, 255, 0.2);
+  color: #00d4ff;
+}
+
+@keyframes pulse-recording {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}
+
+.replay-minimized-bar .minimized-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.replay-minimized-bar .restore-btn,
+.replay-minimized-bar .close-btn {
+  background: none;
+  border: none;
+  font-size: 14px;
+  color: #5a6270;
+  cursor: pointer;
+  transition: all 0.2s;
+  padding: 4px 8px;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.replay-minimized-bar .restore-btn:hover {
+  color: #00d4ff;
+  background: rgba(0, 212, 255, 0.1);
+}
+
+.replay-minimized-bar .close-btn:hover {
+  color: #ff4757;
+  background: rgba(255, 71, 87, 0.1);
+}
+
+/* ==================== 真实数据模式样式 ==================== */
+.badge-realdata {
+  background: linear-gradient(135deg, #00d4ff 0%, #0080ff 100%);
+  color: #fff;
+  padding: 4px 12px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.mode-realdata {
+  background: linear-gradient(135deg, rgba(0, 212, 255, 0.2) 0%, rgba(0, 128, 255, 0.2) 100%);
+  border: 1px solid #00d4ff;
+}
+
+.realdata-progress {
+  font-size: 11px;
+  color: #00d4ff;
+  margin-left: 8px;
+  font-family: 'Consolas', monospace;
+}
+
+.data-source-badge .badge.realdata {
+  background: linear-gradient(135deg, #00d4ff 0%, #0080ff 100%);
+  color: #fff;
+}
+
+.realdata-status {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 12px;
+  background: rgba(0, 212, 255, 0.1);
+  border-radius: 6px;
+  margin-bottom: 12px;
+}
+
+.realdata-status .status-label {
+  color: #8892a0;
+  font-size: 12px;
+}
+
+.realdata-status .status-value {
+  color: #00d4ff;
+  font-size: 14px;
+  font-weight: 600;
+  font-family: 'Consolas', monospace;
+}
+
+.csv-section {
+  border-top: 1px solid #1e3a5f;
+  padding-top: 16px;
+  margin-top: 16px;
+}
+
+.csv-hint {
+  color: #8892a0;
+  font-size: 11px;
+  margin: 4px 0 12px 0;
+}
+
+.btn-csv {
+  width: 100%;
+  background: linear-gradient(135deg, #00d4ff 0%, #0080ff 100%);
+  color: #fff;
+  border: none;
+  padding: 12px 16px;
+  border-radius: 6px;
+  font-size: 14px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.btn-csv:hover:not(:disabled) {
+  background: linear-gradient(135deg, #00e5ff 0%, #0090ff 100%);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(0, 212, 255, 0.3);
+}
+
+.btn-csv:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 /* ==================== 目标列表样式 ==================== */
 .target-list {
   flex: 1;
@@ -2976,6 +3810,26 @@ const onMouseUp = () => {
   font-weight: 600;
   color: #00d4ff;
   letter-spacing: 0.5px;
+}
+
+.qt-callsign-stats {
+  margin-left: auto;
+  font-size: 11px;
+  color: #4ade80;
+  background: rgba(74, 222, 128, 0.15);
+  padding: 2px 8px;
+  border-radius: 10px;
+  border: 1px solid rgba(74, 222, 128, 0.3);
+}
+
+.qt-pending {
+  color: #fbbf24;
+  font-style: italic;
+}
+
+.qt-pending-badge {
+  font-size: 10px;
+  margin-left: -4px;
 }
 
 .quick-targets-scroll {
@@ -3492,6 +4346,14 @@ const onMouseUp = () => {
   border-radius: 50%;
   cursor: pointer;
   box-shadow: 0 0 10px rgba(0, 212, 255, 0.5);
+}
+
+.progress-percent {
+  font-size: 11px;
+  color: #5a6270;
+  text-align: right;
+  margin-top: 4px;
+  font-family: 'Consolas', monospace;
 }
 
 .trajectory-toggle {
@@ -4148,6 +5010,21 @@ const onMouseUp = () => {
   gap: 12px;
 }
 
+.airline-section {
+  margin-bottom: 20px;
+}
+
+.section-header {
+  font-size: 13px;
+  font-weight: 600;
+  color: #8b9cb5;
+  margin-bottom: 12px;
+  padding: 8px 12px;
+  background: rgba(0, 0, 0, 0.2);
+  border-radius: 6px;
+  border-left: 3px solid #00d4ff;
+}
+
 .airline-item {
   display: flex;
   justify-content: space-between;
@@ -4157,6 +5034,11 @@ const onMouseUp = () => {
   border: 1px solid rgba(30, 58, 95, 0.4);
   border-radius: 10px;
   transition: all 0.3s ease;
+}
+
+.airline-item.unknown {
+  border-color: rgba(255, 170, 0, 0.3);
+  background: rgba(255, 170, 0, 0.05);
 }
 
 .airline-item:hover {
@@ -4182,6 +5064,10 @@ const onMouseUp = () => {
   font-weight: 700;
   color: white;
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+}
+
+.airline-logo.unknown {
+  background: linear-gradient(135deg, #ff9800, #ff5722);
 }
 
 .airline-detail {
@@ -4228,6 +5114,60 @@ const onMouseUp = () => {
   background: linear-gradient(90deg, #00d4ff, #0080ff);
   border-radius: 4px;
   transition: width 0.5s ease;
+}
+
+.airline-bar.unknown {
+  background: linear-gradient(90deg, #ff9800, #ff5722);
+}
+
+/* 未识别呼号列表样式 */
+.unknown-callsign-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 8px;
+}
+
+.callsign-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  background: rgba(255, 152, 0, 0.1);
+  border: 1px solid rgba(255, 152, 0, 0.2);
+  border-radius: 6px;
+  font-size: 12px;
+}
+
+.callsign-code {
+  font-weight: 700;
+  color: #ffb74d;
+  font-family: 'Consolas', monospace;
+  min-width: 80px;
+}
+
+.callsign-icao {
+  color: #8b9cb5;
+  font-family: 'Consolas', monospace;
+}
+
+.callsign-country {
+  color: #64b5f6;
+  margin-left: auto;
+}
+
+/* 飞机详情中的航空公司显示 */
+.aircraft-airline {
+  font-size: 12px;
+  color: #4CAF50;
+  margin-top: 4px;
+}
+
+.aircraft-airline.unknown {
+  color: #ff9800;
+}
+
+.param.full-width {
+  flex: 1;
 }
 
 .empty-airline {
